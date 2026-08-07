@@ -92,6 +92,7 @@ fn write_language_field_to_metadata(
         .context("Failed to serialize metadata.json")?;
     std::fs::write(&temp_path, json_string)
         .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+    crate::path_security::harden_private_file(&temp_path).map_err(anyhow::Error::msg)?;
     std::fs::rename(&temp_path, &metadata_path).with_context(|| {
         format!(
             "Failed to replace {} with {}",
@@ -99,6 +100,7 @@ fn write_language_field_to_metadata(
             temp_path.display()
         )
     })?;
+    crate::path_security::harden_private_file(&metadata_path).map_err(anyhow::Error::msg)?;
 
     Ok(())
 }

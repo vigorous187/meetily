@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+# The Homebrew cargo binary links through libgit2 to llhttp. The system
+# Homebrew llhttp keg is incomplete on this machine, so release builds use the
+# already-reviewed local llhttp 9.4.2 build without modifying Homebrew.
+export DYLD_LIBRARY_PATH="/tmp/meetily-llhttp-Qs1EZu/install/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+exec /opt/homebrew/Cellar/rust/1.97.1/bin/cargo "$@"

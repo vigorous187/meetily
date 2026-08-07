@@ -61,11 +61,12 @@ impl MeetingsRepository {
         let mut transaction = conn.begin().await?;
 
         // Get meeting details
-        let meeting: Option<MeetingModel> =
-            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?")
-                .bind(meeting_id)
-                .fetch_optional(&mut *transaction)
-                .await?;
+        let meeting: Option<MeetingModel> = sqlx::query_as(
+            "SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
 
         if meeting.is_none() {
             transaction.rollback().await?;
@@ -74,11 +75,16 @@ impl MeetingsRepository {
 
         if let Some(meeting) = meeting {
             // Get all transcripts for this meeting
-            let transcripts =
-                sqlx::query_as::<_, Transcript>("SELECT * FROM transcripts WHERE meeting_id = ?")
-                    .bind(meeting_id)
-                    .fetch_all(&mut *transaction)
-                    .await?;
+            let transcripts = sqlx::query_as::<_, Transcript>(
+                "SELECT t.*, ms.display_name AS speaker_name
+                 FROM transcripts t
+                 LEFT JOIN meeting_speakers ms
+                   ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id
+                 WHERE t.meeting_id = ?",
+            )
+            .bind(meeting_id)
+            .fetch_all(&mut *transaction)
+            .await?;
 
             transaction.commit().await?;
 
@@ -92,6 +98,9 @@ impl MeetingsRepository {
                     audio_start_time: t.audio_start_time,
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
+                    speaker_name: t.speaker_name,
+                    source: t.source,
+                    speaker_id: t.speaker_id,
                 })
                 .collect::<Vec<_>>();
 
@@ -119,11 +128,12 @@ impl MeetingsRepository {
             ));
         }
 
-        let meeting: Option<MeetingModel> =
-            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?")
-                .bind(meeting_id)
-                .fetch_optional(pool)
-                .await?;
+        let meeting: Option<MeetingModel> = sqlx::query_as(
+            "SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await?;
 
         Ok(meeting)
     }
@@ -142,19 +152,20 @@ impl MeetingsRepository {
         }
 
         // Get total count of transcripts for this meeting
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ?"
-        )
-        .bind(meeting_id)
-        .fetch_one(pool)
-        .await?;
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transcripts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await?;
 
         // Get paginated transcripts ordered by audio_start_time
         let transcripts = sqlx::query_as::<_, Transcript>(
-            "SELECT * FROM transcripts
-             WHERE meeting_id = ?
-             ORDER BY audio_start_time ASC
-             LIMIT ? OFFSET ?"
+            "SELECT t.*, ms.display_name AS speaker_name
+             FROM transcripts t
+             LEFT JOIN meeting_speakers ms
+               ON ms.meeting_id = t.meeting_id AND ms.speaker_id = t.speaker_id
+             WHERE t.meeting_id = ?
+             ORDER BY t.audio_start_time ASC
+             LIMIT ? OFFSET ?",
         )
         .bind(meeting_id)
         .bind(limit)
@@ -225,6 +236,48 @@ impl MeetingsRepository {
             .execute(&mut *transaction)
             .await?;
 
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    /// Update a generated title only while the originating summary generation
+    /// is still the active generation for this meeting.
+    pub async fn update_meeting_name_for_generation(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        generation_id: &str,
+        new_title: &str,
+    ) -> Result<bool, SqlxError> {
+        let mut transaction = pool.begin().await?;
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE meetings
+            SET title = ?, updated_at = ?
+            WHERE id = ?
+              AND EXISTS (
+                  SELECT 1 FROM summary_processes
+                  WHERE meeting_id = ? AND generation_id = ?
+                    AND LOWER(status) IN ('pending', 'processing')
+              )
+            "#,
+        )
+        .bind(new_title)
+        .bind(now)
+        .bind(meeting_id)
+        .bind(meeting_id)
+        .bind(generation_id)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE transcript_chunks SET meeting_name = ? WHERE meeting_id = ?")
+            .bind(new_title)
+            .bind(meeting_id)
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(true)
     }

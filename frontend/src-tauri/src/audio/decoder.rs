@@ -19,8 +19,15 @@ use symphonia::core::probe::Hint;
 use super::audio_processing::{audio_to_mono, resample, resample_audio};
 use super::ffmpeg::find_ffmpeg_path;
 
-/// Extensions requiring ffmpeg pre-conversion (Symphonia lacks these demuxers/codecs)
-const FFMPEG_ONLY_EXTENSIONS: &[&str] = &["mkv", "webm", "wma"];
+/// Extensions requiring FFmpeg pre-conversion.
+///
+/// Symphonia can open MP4/M4A/AAC containers, but its AAC output has caused
+/// Silero VAD to miss speech in recordings produced by Meetily. FFmpeg's PCM
+/// conversion preserves the same audio for VAD and transcription, so prefer it
+/// for recorded AAC containers as well as formats Symphonia cannot open.
+const FFMPEG_PRECONVERT_EXTENSIONS: &[&str] = &[
+    "mkv", "webm", "wma", "mp4", "m4a", "aac", "mov",
+];
 
 /// Progress callback for long-running operations
 /// Returns current progress (0-100) and a message
@@ -265,7 +272,7 @@ fn normalize_audio_samples(mut samples: Vec<f32>) -> Vec<f32> {
 fn needs_ffmpeg_conversion(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| FFMPEG_ONLY_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .map(|ext| FFMPEG_PRECONVERT_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -325,6 +332,8 @@ fn convert_to_wav_with_ffmpeg(
             "-i", input_str,
             "-vn",                  // Strip video tracks
             "-acodec", "pcm_s16le", // Output PCM WAV (Symphonia handles natively)
+            "-ac", "1",             // Transcription and VAD require mono audio
+            "-ar", "16000",         // Avoid a second resample that can erase speech cues
             "-y",                   // Overwrite without prompt
             output_str,
         ])
@@ -807,18 +816,21 @@ mod tests {
         assert!(needs_ffmpeg_conversion(Path::new("video.mkv")));
         assert!(needs_ffmpeg_conversion(Path::new("audio.webm")));
         assert!(needs_ffmpeg_conversion(Path::new("audio.wma")));
+        assert!(needs_ffmpeg_conversion(Path::new("recording.mp4")));
+        assert!(needs_ffmpeg_conversion(Path::new("recording.m4a")));
+        assert!(needs_ffmpeg_conversion(Path::new("recording.aac")));
+        assert!(needs_ffmpeg_conversion(Path::new("recording.mov")));
         // Case insensitive
         assert!(needs_ffmpeg_conversion(Path::new("meeting.MKV")));
         assert!(needs_ffmpeg_conversion(Path::new("audio.WMA")));
         assert!(needs_ffmpeg_conversion(Path::new("audio.WebM")));
-        // Symphonia-native formats should NOT need ffmpeg
-        assert!(!needs_ffmpeg_conversion(Path::new("audio.mp4")));
+        assert!(needs_ffmpeg_conversion(Path::new("meeting.MP4")));
+        assert!(needs_ffmpeg_conversion(Path::new("meeting.M4A")));
+        // Formats that decode reliably through Symphonia stay native.
         assert!(!needs_ffmpeg_conversion(Path::new("audio.wav")));
         assert!(!needs_ffmpeg_conversion(Path::new("audio.mp3")));
         assert!(!needs_ffmpeg_conversion(Path::new("audio.flac")));
         assert!(!needs_ffmpeg_conversion(Path::new("audio.ogg")));
-        assert!(!needs_ffmpeg_conversion(Path::new("audio.aac")));
-        assert!(!needs_ffmpeg_conversion(Path::new("audio.m4a")));
         // No extension
         assert!(!needs_ffmpeg_conversion(Path::new("noext")));
     }

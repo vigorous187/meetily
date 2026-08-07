@@ -76,15 +76,6 @@ pub fn get_default_recordings_folder() -> PathBuf {
     }
 }
 
-/// Ensure the recordings directory exists
-pub fn ensure_recordings_directory(path: &PathBuf) -> Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path)?;
-        info!("Created recordings directory: {:?}", path);
-    }
-    Ok(())
-}
-
 /// Generate a unique filename for a recording
 pub fn generate_recording_filename(format: &str) -> String {
     let now = chrono::Utc::now();
@@ -106,7 +97,7 @@ pub async fn load_recording_preferences<R: Runtime>(
     };
 
     // Try to get the preferences from store
-    let prefs = if let Some(value) = store.get("preferences") {
+    let mut prefs = if let Some(value) = store.get("preferences") {
         match serde_json::from_value::<RecordingPreferences>(value.clone()) {
             Ok(mut p) => {
                 info!("Loaded recording preferences from store");
@@ -128,9 +119,24 @@ pub async fn load_recording_preferences<R: Runtime>(
         RecordingPreferences::default()
     };
 
-    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
-          prefs.save_folder, prefs.auto_save, prefs.file_format,
-          prefs.preferred_mic_device, prefs.preferred_system_device);
+    prefs.save_folder =
+        match crate::path_security::ensure_approved_directory(app, &prefs.save_folder) {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(
+                    "Stored recordings folder was rejected; using the approved default: {}",
+                    error
+                );
+                let default_folder = get_default_recordings_folder();
+                crate::path_security::ensure_approved_directory(app, &default_folder)
+                    .map_err(anyhow::Error::msg)?
+            }
+        };
+
+    info!(
+        "Loaded recording preferences: auto_save={}, format={}",
+        prefs.auto_save, prefs.file_format
+    );
     Ok(prefs)
 }
 
@@ -139,9 +145,15 @@ pub async fn save_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
     preferences: &RecordingPreferences,
 ) -> Result<()> {
-    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
-          preferences.save_folder, preferences.auto_save, preferences.file_format,
-          preferences.preferred_mic_device, preferences.preferred_system_device);
+    let mut preferences = preferences.clone();
+    preferences.save_folder =
+        crate::path_security::ensure_approved_directory(app, &preferences.save_folder)
+            .map_err(anyhow::Error::msg)?;
+
+    info!(
+        "Saving recording preferences: auto_save={}, format={}",
+        preferences.auto_save, preferences.file_format
+    );
 
     // Get or create store
     let store = app
@@ -149,7 +161,7 @@ pub async fn save_recording_preferences<R: Runtime>(
         .map_err(|e| anyhow::anyhow!("Failed to access store: {}", e))?;
 
     // Serialize preferences to JSON value
-    let prefs_value = serde_json::to_value(preferences)
+    let prefs_value = serde_json::to_value(&preferences)
         .map_err(|e| anyhow::anyhow!("Failed to serialize preferences: {}", e))?;
 
     // Save to store
@@ -170,9 +182,6 @@ pub async fn save_recording_preferences<R: Runtime>(
             crate::audio::capture::set_current_backend(backend);
         }
     }
-
-    // Ensure the directory exists
-    ensure_recordings_directory(&preferences.save_folder)?;
 
     Ok(())
 }
@@ -209,10 +218,6 @@ pub async fn open_recordings_folder<R: Runtime>(app: AppHandle<R>) -> Result<(),
         .await
         .map_err(|e| format!("Failed to load preferences: {}", e))?;
 
-    // Ensure directory exists before trying to open it
-    ensure_recordings_directory(&preferences.save_folder)
-        .map_err(|e| format!("Failed to create directory: {}", e))?;
-
     let folder_path = preferences.save_folder.to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
@@ -226,6 +231,7 @@ pub async fn open_recordings_folder<R: Runtime>(app: AppHandle<R>) -> Result<(),
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
+            .arg("--")
             .arg(&folder_path)
             .spawn()
             .map_err(|e| format!("Failed to open folder: {}", e))?;
@@ -239,7 +245,7 @@ pub async fn open_recordings_folder<R: Runtime>(app: AppHandle<R>) -> Result<(),
             .map_err(|e| format!("Failed to open folder: {}", e))?;
     }
 
-    info!("Opened recordings folder: {}", folder_path);
+    info!("Opened approved recordings folder");
     Ok(())
 }
 
@@ -384,4 +390,3 @@ pub async fn get_audio_backend_info() -> Result<Vec<BackendInfo>, String> {
         }])
     }
 }
-

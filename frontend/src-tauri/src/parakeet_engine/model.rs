@@ -477,13 +477,16 @@ impl ParakeetModel {
         let samples_len = samples.len();
 
         // Create waveforms array [batch_size, samples_len]
-        let waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
+        let mut waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
 
         // Create waveforms_lens array [batch_size] with the actual length
         let waveforms_lens = Array1::from_vec(vec![samples_len as i64]).into_dyn();
 
         // Run recognition to get detailed results
-        let results = self.recognize_batch(&waveforms.view(), &waveforms_lens.view())?;
+        let recognition = self.recognize_batch(&waveforms.view(), &waveforms_lens.view());
+        waveforms.fill(0.0);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        let results = recognition?;
 
         // Extract the first (and only) result
         let timestamped_result = results.into_iter().next().ok_or_else(|| {

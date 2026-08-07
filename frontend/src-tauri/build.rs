@@ -1,5 +1,9 @@
 #[path = "build/ffmpeg.rs"]
 mod ffmpeg;
+#[path = "build/onnxruntime.rs"]
+mod onnxruntime;
+#[path = "build/sidecars.rs"]
+mod sidecars;
 
 fn main() {
     // GPU Acceleration Detection and Build Guidance
@@ -15,8 +19,11 @@ fn main() {
         // The swift-rs crate build will be handled in the enhanced_macos crate's build.rs
     }
 
-    // Download and bundle FFmpeg binary at build-time
+    // Verify all reviewed, locally prepared external binaries before Tauri
+    // copies them into the target directory and application bundle.
     ffmpeg::ensure_ffmpeg_binary();
+    onnxruntime::ensure_onnxruntime_archive();
+    sidecars::ensure_reviewed_sidecars();
 
     tauri_build::build()
 }

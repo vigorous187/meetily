@@ -144,6 +144,10 @@ export function PermissionsStep() {
           />
         </div>
 
+        <p className="text-xs text-muted-foreground">
+          After setup, Meetily checks microphone activity locally to offer a recording prompt when a supported meeting app is active. Detection audio is never saved, transcribed, or sent anywhere.
+        </p>
+
         {/* Action Buttons */}
         <div className="flex flex-col gap-3 pt-4">
           <Button onClick={handleFinish} disabled={!allPermissionsGranted} className="w-full h-11">

@@ -413,6 +413,7 @@ export function SummaryPanel({
           )}
           <div className="p-6 w-full">
             <BlockNoteSummaryView
+              key={meeting.id}
               ref={summaryRef}
               summaryData={aiSummary}
               onSave={onSaveSummary}

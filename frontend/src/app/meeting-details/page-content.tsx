@@ -21,6 +21,8 @@ import { useConfig } from '@/contexts/ConfigContext';
 export default function PageContent({
   meeting,
   summaryData,
+  hydratedSummaryStatus = 'idle',
+  hydratedSummaryError = null,
   shouldAutoGenerate = false,
   onAutoGenerateComplete,
   onMeetingUpdated,
@@ -35,6 +37,8 @@ export default function PageContent({
 }: {
   meeting: any;
   summaryData: Summary | null;
+  hydratedSummaryStatus?: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+  hydratedSummaryError?: string | null;
   shouldAutoGenerate?: boolean;
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
@@ -120,7 +124,15 @@ export default function PageContent({
     updateMeetingTitle: meetingData.updateMeetingTitle,
     setAiSummary: meetingData.setAiSummary,
     onOpenModelSettings: handleOpenModelSettings,
+    hydratedSummaryStatus,
+    hydratedSummaryError,
   });
+  const autoGenerateRef = useRef(summaryGeneration.handleGenerateSummary);
+  const onAutoGenerateCompleteRef = useRef(onAutoGenerateComplete);
+  const autoGenerateModelRef = useRef(modelConfig);
+  autoGenerateRef.current = summaryGeneration.handleGenerateSummary;
+  onAutoGenerateCompleteRef.current = onAutoGenerateComplete;
+  autoGenerateModelRef.current = modelConfig;
 
   const copyOperations = useCopyOperations({
     meeting,
@@ -145,12 +157,13 @@ export default function PageContent({
 
     const autoGenerate = async () => {
       if (shouldAutoGenerate && meetingData.transcripts.length > 0 && !cancelled) {
-        console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
-        await summaryGeneration.handleGenerateSummary('');
+        const activeModel = autoGenerateModelRef.current;
+        console.log(`🤖 Auto-generating summary with ${activeModel.provider}/${activeModel.model}...`);
+        await autoGenerateRef.current('');
 
         // Notify parent that auto-generation is complete (only if not cancelled)
-        if (onAutoGenerateComplete && !cancelled) {
-          onAutoGenerateComplete();
+        if (onAutoGenerateCompleteRef.current && !cancelled) {
+          onAutoGenerateCompleteRef.current();
         }
       }
     };
@@ -161,7 +174,7 @@ export default function PageContent({
     return () => {
       cancelled = true;
     };
-  }, [shouldAutoGenerate, meeting.id]); // Re-run if meeting changes
+  }, [shouldAutoGenerate, meeting.id, meetingData.transcripts.length]);
 
   return (
     <motion.div
@@ -176,6 +189,8 @@ export default function PageContent({
           customPrompt={customPrompt}
           onPromptChange={setCustomPrompt}
           onCopyTranscript={copyOperations.handleCopyTranscript}
+          onExportMeeting={copyOperations.handleExportMeeting}
+          hasExportableContent={meetingData.transcripts.length > 0 || Boolean(meetingData.aiSummary)}
           onOpenMeetingFolder={meetingOperations.handleOpenMeetingFolder}
           isRecording={isRecording}
           disableAutoScroll={true}

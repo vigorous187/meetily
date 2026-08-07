@@ -41,6 +41,13 @@ pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod dictation;
+pub mod diarization;
+mod export_core;
+pub mod export;
+mod model_integrity;
+pub mod meeting_detection;
+mod path_security;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -49,6 +56,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod semantic_search;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -87,13 +95,7 @@ async fn start_recording<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
-    log_info!("🔥 CALLED start_recording with meeting: {:?}", meeting_name);
-    log_info!(
-        "📋 Backend received parameters - mic: {:?}, system: {:?}, meeting: {:?}",
-        mic_device_name,
-        system_device_name,
-        meeting_name
-    );
+    log_info!("Start recording requested");
 
     if is_recording().await {
         return Err("Recording already in progress".to_string());
@@ -151,11 +153,16 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         return Ok(());
     }
 
+    let save_path = path_security::validate_new_file(
+        &app,
+        std::path::Path::new(&args.save_path),
+    )?;
+
     // Call the actual audio recording system to stop
     match audio::recording_commands::stop_recording(
         app.clone(),
         audio::recording_commands::RecordingArgs {
-            save_path: args.save_path.clone(),
+            save_path: save_path.to_string_lossy().into_owned(),
         },
     )
     .await
@@ -163,18 +170,6 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         Ok(_) => {
             RECORDING_FLAG.store(false, Ordering::SeqCst);
             tray::update_tray_menu(&app);
-
-            // Create the save directory if it doesn't exist
-            if let Some(parent) = std::path::Path::new(&args.save_path).parent() {
-                if !parent.exists() {
-                    log_info!("Creating directory: {:?}", parent);
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        let err_msg = format!("Failed to create save directory: {}", e);
-                        log_error!("{}", err_msg);
-                        return Err(err_msg);
-                    }
-                }
-            }
 
             // Show recording stopped notification through NotificationManager
             // This respects user's notification preferences
@@ -220,31 +215,13 @@ fn get_transcription_status() -> TranscriptionStatus {
 }
 
 #[tauri::command]
-fn read_audio_file(file_path: String) -> Result<Vec<u8>, String> {
+fn read_audio_file<R: Runtime>(app: AppHandle<R>, file_path: String) -> Result<Vec<u8>, String> {
+    let file_path =
+        path_security::validate_existing_app_audio_file(&app, std::path::Path::new(&file_path))?;
     match std::fs::read(&file_path) {
         Ok(data) => Ok(data),
         Err(e) => Err(format!("Failed to read audio file: {}", e)),
     }
-}
-
-#[tauri::command]
-async fn save_transcript(file_path: String, content: String) -> Result<(), String> {
-    log_info!("Saving transcript to: {}", file_path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = std::path::Path::new(&file_path).parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {}", e))?;
-        }
-    }
-
-    // Write content to file
-    std::fs::write(&file_path, content)
-        .map_err(|e| format!("Failed to write transcript: {}", e))?;
-
-    log_info!("Transcript saved successfully");
-    Ok(())
 }
 
 // Audio level monitoring commands
@@ -310,8 +287,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
-    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
-             mic_device_name, system_device_name, meeting_name);
+    log_info!("Start recording with selected devices requested");
 
     // Clone meeting_name for notification use later
     let meeting_name_for_notification = meeting_name.clone();
@@ -319,10 +295,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Call the recording module functions that support meeting names
     let recording_result = match (mic_device_name.clone(), system_device_name.clone()) {
         (None, None) => {
-            log_info!(
-                "No devices specified, starting with defaults and meeting: {:?}",
-                meeting_name
-            );
+            log_info!("No devices specified; starting with defaults");
             audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
                 .await
         }
@@ -407,10 +380,9 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
         .manage(Arc::new(RwLock::new(
             None::<notifications::manager::NotificationManager<tauri::Wry>>,
@@ -499,6 +471,23 @@ pub fn run() {
             })
             .expect("Failed to initialize database");
 
+            // Repair or populate the private semantic index for existing
+            // meetings without delaying the main window. This is local-only;
+            // the verified model and SQLite database both live in app data.
+            let app_for_search = _app.handle().clone();
+            let search_pool = _app
+                .state::<state::AppState>()
+                .db_manager
+                .pool()
+                .clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    api::backfill_local_search_index(&app_for_search, &search_pool).await
+                {
+                    log::warn!("Unable to backfill the local meeting search index: {}", error);
+                }
+            });
+
             // Initialize bundled templates directory for dynamic template discovery
             log::info!("Initializing bundled templates directory...");
             if let Ok(resource_path) = _app.handle().path().resource_dir() {
@@ -528,8 +517,15 @@ pub fn run() {
             stop_recording,
             is_recording,
             get_transcription_status,
+            dictation::start_dictation,
+            dictation::stop_dictation,
+            dictation::cancel_dictation,
+            meeting_detection::runtime::start_meeting_detection,
+            meeting_detection::runtime::stop_meeting_detection,
+            meeting_detection::runtime::dismiss_meeting_detection,
+            meeting_detection::runtime::is_meeting_detection_running,
             read_audio_file,
-            save_transcript,
+            export::export_meeting_markdown,
             analytics::commands::init_analytics,
             analytics::commands::disable_analytics,
             analytics::commands::track_event,
@@ -627,36 +623,24 @@ pub fn run() {
             ollama::pull_ollama_model,
             ollama::delete_ollama_model,
             ollama::get_ollama_model_context,
-            openai::openai::get_openai_models,
-            anthropic::anthropic::get_anthropic_models,
-            groq::groq::get_groq_models,
             api::api_get_meetings,
             api::api_search_transcripts,
-            api::api_get_profile,
-            api::api_save_profile,
-            api::api_update_profile,
+            api::api_index_meeting_for_search,
             api::api_get_model_config,
             api::api_save_model_config,
-            api::api_get_api_key,
             // api::api_get_auto_generate_setting,
             // api::api_save_auto_generate_setting,
             api::api_get_transcript_config,
             api::api_save_transcript_config,
-            api::api_get_transcript_api_key,
             api::api_delete_meeting,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
             api::api_get_meeting_transcripts,
             api::api_save_meeting_title,
+            api::api_rename_meeting_speaker,
             api::api_save_transcript,
             api::open_meeting_folder,
-            api::test_backend_connection,
-            api::debug_backend_connection,
             api::open_external_url,
-            // Custom OpenAI commands
-            api::api_save_custom_openai_config,
-            api::api_get_custom_openai_config,
-            api::api_test_custom_openai_connection,
             // Summary commands
             summary::commands::api_process_transcript,
             summary::commands::api_get_summary,
@@ -680,7 +664,6 @@ pub fn run() {
             summary::summary_engine::commands::builtin_ai_is_model_ready,
             summary::summary_engine::commands::builtin_ai_get_available_summary_model,
             summary::summary_engine::commands::builtin_ai_get_recommended_model,
-            openrouter::get_openrouter_models,
             audio::recording_preferences::get_recording_preferences,
             audio::recording_preferences::set_recording_preferences,
             audio::recording_preferences::get_default_recordings_folder_path,

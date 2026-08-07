@@ -10,7 +10,8 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use crate::config::WHISPER_MODEL_CATALOG;
+use crate::config::{whisper_model_sha256, WHISPER_MODEL_CATALOG, WHISPER_MODEL_REVISION};
+use crate::model_integrity::verify_sha256;
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,12 +186,19 @@ impl WhisperEngine {
                         let expected_min_size_mb = (size_mb as f64 * 0.9) as u64; // Allow 90% of expected size as minimum for more accurate corruption detection
 
                         if file_size_mb >= expected_min_size_mb && file_size_mb > 1 {
-                            // File size looks good, but let's also check if it's a valid GGML file
-                            match self.validate_model_file(&model_path).await {
-                                Ok(_) => ModelStatus::Available,
-                                Err(_) => {
+                            let trusted_hash = whisper_model_sha256(name)
+                                .ok_or_else(|| anyhow!("No trusted hash configured for model {}", name))?;
+                            // Require both the pinned digest and the GGML header before loading.
+                            let integrity_result = match verify_sha256(&model_path, trusted_hash).await {
+                                Ok(()) => self.validate_model_file(&model_path).await,
+                                Err(error) => Err(error),
+                            };
+                            match integrity_result {
+                                Ok(()) => ModelStatus::Available,
+                                Err(error) => {
                                     log::warn!("Model file {} has correct size but appears corrupted (failed validation)",
                                              filename);
+                                    log::debug!("Model validation error: {}", error);
                                     ModelStatus::Corrupted {
                                         file_size: file_size_bytes,
                                         expected_min_size: (expected_min_size_mb * 1024 * 1024) as u64
@@ -371,8 +379,10 @@ impl WhisperEngine {
 
         // Check for obviously meaningless patterns first
         if Self::is_meaningless_output(text) {
-            // Performance optimization: reduce meaningless output logging to debug level
-            perf_debug!("Detected meaningless output, returning empty: '{}'", text);
+            perf_debug!(
+                "Detected meaningless transcription output ({} characters); returning empty",
+                text.len()
+            );
             return String::new();
         }
 
@@ -390,8 +400,10 @@ impl WhisperEngine {
         // Check for overall repetition ratio
         let final_text = cleaned_words.join(" ");
         if Self::calculate_repetition_ratio(&final_text) > 0.7 {
-            // Performance optimization: reduce repetition ratio logging to debug level
-            perf_debug!("High repetition ratio detected, filtering out: '{}'", final_text);
+            perf_debug!(
+                "High transcription repetition ratio detected ({} characters); filtering output",
+                final_text.len()
+            );
             return String::new();
         }
 
@@ -514,6 +526,7 @@ impl WhisperEngine {
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        let audio_data = crate::dictation::ZeroizingAudio::new(audio_data);
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -631,6 +644,7 @@ impl WhisperEngine {
     }
 
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {
+        let audio_data = crate::dictation::ZeroizingAudio::new(audio_data);
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -789,14 +803,27 @@ impl WhisperEngine {
             }
         } else {
             if cleaned_result != final_result {
-                log::info!("Cleaned repetitive transcription #{}: '{}' -> '{}'", transcription_count, final_result, cleaned_result);
+                log::info!(
+                    "Cleaned repetitive transcription #{} ({} to {} characters)",
+                    transcription_count,
+                    final_result.len(),
+                    cleaned_result.len()
+                );
             }
             // Reduce successful transcription logging frequency
             // Only log every 5th result or significant results (>50 chars) to reduce I/O overhead
             if transcription_count % 5 == 0 || cleaned_result.len() > 50 || duration_seconds > 10.0 {
-                log::info!("Transcription #{} result: '{}'", transcription_count, cleaned_result);
+                log::info!(
+                    "Transcription #{} produced {} characters",
+                    transcription_count,
+                    cleaned_result.len()
+                );
             } else {
-                perf_debug!("Transcription #{} result: '{}'", transcription_count, cleaned_result);
+                perf_debug!(
+                    "Transcription #{} produced {} characters",
+                    transcription_count,
+                    cleaned_result.len()
+                );
             }
         }
 
@@ -897,6 +924,18 @@ impl WhisperEngine {
     pub async fn download_model(&self, model_name: &str, progress_callback: Option<Box<dyn Fn(u8) + Send>>) -> Result<()> {
         log::info!("Starting download for model: {}", model_name);
 
+        let expected_sha256 = whisper_model_sha256(model_name)
+            .ok_or_else(|| anyhow!("Unsupported model: {}", model_name))?;
+        let filename = format!("ggml-{}.bin", model_name);
+        if !WHISPER_MODEL_CATALOG.iter().any(|entry| entry.0 == model_name && entry.1 == filename) {
+            return Err(anyhow!("Model filename is not in the trusted catalog"));
+        }
+        let model_url = format!(
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/{}/{}",
+            WHISPER_MODEL_REVISION,
+            filename
+        );
+
         // Check if download is already in progress for this model
         {
             let active = self.active_downloads.read().await;
@@ -918,33 +957,7 @@ impl WhisperEngine {
             *cancel_flag = None;
         }
 
-        // Official ggerganov/whisper.cpp model URLs from Hugging Face
-        let model_url = match model_name {
-            // Standard f16 models
-            "tiny" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-            "base" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
-            "small" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-            "medium" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-            "large-v3-turbo" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-            "large-v3" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-
-            // Q5_1 quantized models
-            "tiny-q5_1" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q5_1.bin",
-            "base-q5_1" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin",
-            "small-q5_1" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
-
-            // Q5_0 quantized models
-            "medium-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin",
-            "large-v3-turbo-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
-            "large-v3-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
-
-            _ => return Err(anyhow!("Unsupported model: {}", model_name))
-        };
-        
         log::info!("Model URL for {}: {}", model_name, model_url);
-        
-        // Generate correct filename - all models follow ggml-{model_name}.bin pattern
-        let filename = format!("ggml-{}.bin", model_name);
         let file_path = self.models_dir.join(&filename);
         
         log::info!("Downloading to file path: {}", file_path.display());
@@ -967,7 +980,7 @@ impl WhisperEngine {
         let client = Client::new();
         
         log::info!("Sending GET request to: {}", model_url);
-        let response = client.get(model_url).send().await
+        let response = client.get(&model_url).send().await
             .map_err(|e| anyhow!("Failed to start download: {}", e))?;
         
         log::info!("Received response with status: {}", response.status());
@@ -1075,6 +1088,20 @@ impl WhisperEngine {
         
         file.flush().await
             .map_err(|e| anyhow!("Failed to flush file: {}", e))?;
+        drop(file);
+
+        if let Err(error) = verify_sha256(&file_path, expected_sha256).await {
+            let _ = fs::remove_file(&file_path).await;
+            {
+                let mut models = self.available_models.write().await;
+                if let Some(model_info) = models.get_mut(model_name) {
+                    model_info.status = ModelStatus::Error("Downloaded model failed integrity verification".to_string());
+                }
+            }
+            let mut active = self.active_downloads.write().await;
+            active.remove(model_name);
+            return Err(anyhow!("Downloaded model failed integrity verification: {}", error));
+        }
         
         log::info!("Download completed for model: {}", model_name);
         

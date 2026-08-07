@@ -80,14 +80,13 @@ export function BluetoothPlaybackWarning({
             For accurate review, please use <strong>computer speakers</strong> or{' '}
             <strong>wired headphones</strong>.
             <br />
-            <a
-              href="https://github.com/your-org/meetily/blob/main/BLUETOOTH_PLAYBACK_NOTICE.md"
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              type="button"
+              onClick={() => invoke('open_external_url', { url: 'https://github.com/Zackriya-Solutions/meeting-minutes' })}
               className="underline hover:text-yellow-900 font-medium mt-2 inline-block"
             >
               Learn why this happens →
-            </a>
+            </button>
           </AlertDescription>
         </div>
         <Button

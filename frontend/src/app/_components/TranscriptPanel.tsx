@@ -45,6 +45,9 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      source: t.source,
+      speakerId: t.speaker_id,
+      speakerName: t.speaker_name,
     })),
     [transcripts]
   );

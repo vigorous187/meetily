@@ -1,6 +1,7 @@
 use crate::api::{TranscriptSearchResult, TranscriptSegment};
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ impl TranscriptsRepository {
         meeting_title: &str,
         transcripts: &[TranscriptSegment],
         folder_path: Option<String>,
+        diarization_ranges: &[crate::diarization::DiarizationRange],
     ) -> Result<String, SqlxError> {
         let meeting_id = format!("meeting-{}", Uuid::new_v4());
 
@@ -36,19 +38,85 @@ impl TranscriptsRepository {
         .await;
 
         if let Err(e) = result {
-            error!("Failed to create meeting '{}': {}", meeting_title, e);
+            error!("Failed to create meeting record: {}", e);
             transaction.rollback().await?;
             return Err(e);
         }
 
         info!("Successfully created meeting with id: {}", meeting_id);
 
+        // Apply deterministic local speaker mapping and conservative echo suppression.
+        // Unknown/imported sources are preserved unchanged.
+        let diarization_input = transcripts
+            .iter()
+            .filter_map(|segment| {
+                let source = match segment.source.as_str() {
+                    "mic" => crate::diarization::AudioSource::Microphone,
+                    "system" => crate::diarization::AudioSource::System,
+                    _ => return None,
+                };
+                Some(crate::diarization::TranscriptSegment {
+                    id: segment.id.clone(),
+                    meeting_id: meeting_id.clone(),
+                    text: segment.text.clone(),
+                    start_ms: (segment.audio_start_time.unwrap_or(0.0).max(0.0) * 1000.0) as u64,
+                    end_ms: (segment.audio_end_time.unwrap_or(0.0).max(0.0) * 1000.0) as u64,
+                    source,
+                })
+            })
+            .collect();
+        let mapped = crate::diarization::runtime::process_cached_ranges(
+            &meeting_id,
+            diarization_input,
+            diarization_ranges.to_vec(),
+        )
+        .await;
+        let kept_known_ids: HashSet<&str> = mapped
+            .segments
+            .iter()
+            .map(|segment| segment.id.as_str())
+            .collect();
+        let mapped_speakers: HashMap<&str, &crate::diarization::Speaker> = mapped
+            .segments
+            .iter()
+            .map(|segment| (segment.id.as_str(), &segment.speaker))
+            .collect();
+
+        for speaker in &mapped.speakers {
+            let source = match speaker.kind {
+                crate::diarization::SpeakerKind::You => "mic",
+                _ => "system",
+            };
+            sqlx::query(
+                "INSERT INTO meeting_speakers (meeting_id, speaker_id, display_name, source)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(meeting_id, speaker_id) DO UPDATE SET
+                   display_name = excluded.display_name,
+                   source = excluded.source,
+                   updated_at = CURRENT_TIMESTAMP",
+            )
+            .bind(&meeting_id)
+            .bind(&speaker.id)
+            .bind(&speaker.name)
+            .bind(source)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
         // 2. Save each transcript segment with audio timing fields
         for segment in transcripts {
+            if matches!(segment.source.as_str(), "mic" | "system")
+                && !kept_known_ids.contains(segment.id.as_str())
+            {
+                continue;
+            }
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
+            let mapped_speaker_id = mapped_speakers
+                .get(segment.id.as_str())
+                .map(|speaker| speaker.id.as_str());
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source, speaker_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&transcript_id)
             .bind(&meeting_id)
@@ -57,6 +125,8 @@ impl TranscriptsRepository {
             .bind(segment.audio_start_time)
             .bind(segment.audio_end_time)
             .bind(segment.duration)
+            .bind(&segment.source)
+            .bind(mapped_speaker_id.or(segment.speaker_id.as_deref()))
             .execute(&mut *transaction)
             .await;
 

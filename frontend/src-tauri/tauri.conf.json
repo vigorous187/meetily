@@ -1,7 +1,7 @@
 {
     "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-    "productName": "meetily",
-    "version": "0.4.0",
+    "productName": "Meetily Plus",
+    "version": "0.4.3",
     "identifier": "com.meetily.ai",
     "build": {
         "frontendDist": "../out",
@@ -12,7 +12,7 @@
     "app": {
         "windows": [
             {
-                "title": "meetily",
+                "title": "Meetily Plus",
                 "width": 1100,
                 "height": 700,
                 "resizable": true,
@@ -26,32 +26,17 @@
             "csp": {
                 "default-src": "'self'",
                 "style-src": "'self' 'unsafe-inline'",
-                "img-src": "'self' asset: https://asset.localhost data:",
-                "connect-src": "'self' http://localhost:11434 http://localhost:5167 http://localhost:8178 https://api.ollama.ai"
-            },
-            "assetProtocol": {
-                "enable": true,
-                "scope": [
-                    "$APPDATA/**"
-                ]
+                "img-src": "'self' data:",
+                "connect-src": "'self' ipc: http://ipc.localhost"
             },
             "capabilities": [
                 {
                     "identifier": "main",
-                    "description": "Main window capability with file system and media access",
+                    "description": "Main window capability with the minimum local APIs required by the audited fork",
                     "windows": [
                         "main"
                     ],
                     "permissions": [
-                        "fs:default",
-                        "fs:allow-read-file",
-                        "fs:read-all",
-                        "fs:write-all",
-                        "fs:allow-app-read",
-                        "fs:allow-app-write",
-                        "fs:allow-download-write",
-                        "fs:allow-download-read",
-                        "fs:scope-download",
                         "core:path:default",
                         "core:event:default",
                         "core:window:default",
@@ -63,16 +48,9 @@
                         "store:default",
                         "notification:default",
                         "notification:allow-is-permission-granted",
-                        "updater:default",
-                        "process:default",
-                        {
-                            "identifier": "fs:scope",
-                            "allow": [
-                                {
-                                    "path": "$APPDATA/*"
-                                }
-                            ]
-                        }
+                        "global-shortcut:allow-register",
+                        "global-shortcut:allow-unregister",
+                        "global-shortcut:allow-is-registered"
                     ]
                 }
             ]
@@ -88,34 +66,32 @@
             "app",
             "dmg"
         ],
-        "createUpdaterArtifacts": true,
+        "createUpdaterArtifacts": false,
         "icon": [
             "icons/icon.png",
             "icons/app_icon.icns",
             "icons/app_icon.ico"
         ],
         "resources": [
-            "templates/*.json"
+            "templates/*.json",
+            "binaries/FFMPEG-PROVENANCE.md",
+            "binaries/SIDECAR-PROVENANCE.md",
+            "binaries/COPYING.LGPLv2.1",
+            "vendor/onnxruntime/PROVENANCE.md",
+            "vendor/onnxruntime/LICENSE"
         ],
         "externalBin": [
             "binaries/llama-helper",
+            "binaries/diarization-helper",
             "binaries/ffmpeg"
         ],
         "macOS": {
             "entitlements": "entitlements.plist",
-            "signingIdentity": "-",
-            "hardenedRuntime": true
+            "hardenedRuntime": true,
+            "minimumSystemVersion": "14.2"
         },
         "windows": {
             "signCommand": "powershell -ExecutionPolicy Bypass -File scripts/sign-windows.ps1 -FilePath %1"
-        }
-    },
-    "plugins": {
-        "updater": {
-            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVDQTYzMUQ3ODc5N0M4MkEKUldRcXlKZUgxekdtN09DRkVWSHNpZlJseEVOUmpNd1dDSTNaLzZ3MXJGTnY3WW1pdnlOYjBpbkIK",
-            "endpoints": [
-                "https://github.com/Zackriya-Solutions/meeting-minutes/releases/latest/download/latest.json"
-            ]
         }
     }
 }

@@ -44,14 +44,15 @@ pub fn create_meeting_folder(
 
     // Create main meeting folder
     std::fs::create_dir_all(&meeting_folder)?;
+    crate::path_security::harden_private_directory(&meeting_folder)
+        .map_err(anyhow::Error::msg)?;
 
     // Only create .checkpoints subdirectory if requested (when auto_save is true)
     if create_checkpoints_dir {
         let checkpoints_dir = meeting_folder.join(".checkpoints");
         std::fs::create_dir_all(&checkpoints_dir)?;
-        log::info!("Created meeting folder with checkpoints: {}", meeting_folder.display());
-    } else {
-        log::info!("Created meeting folder without checkpoints: {}", meeting_folder.display());
+        crate::path_security::harden_private_directory(&checkpoints_dir)
+            .map_err(anyhow::Error::msg)?;
     }
 
     Ok(meeting_folder)
@@ -637,6 +638,8 @@ pub fn write_audio_to_file_with_meeting_name(
         if !meeting_folder.exists() {
             std::fs::create_dir_all(&meeting_folder)?;
         }
+        crate::path_security::harden_private_directory(&meeting_folder)
+            .map_err(anyhow::Error::msg)?;
 
         meeting_folder
     } else {
@@ -688,6 +691,7 @@ pub fn write_transcript_to_file(
 
     // Write transcript to file
     std::fs::write(&file_path, transcript_text)?;
+    crate::path_security::harden_private_file(&file_path).map_err(anyhow::Error::msg)?;
 
     Ok(file_path.to_string_lossy().to_string())
 }
@@ -712,6 +716,8 @@ pub fn write_transcript_json_to_file(
         if !meeting_folder.exists() {
             std::fs::create_dir_all(&meeting_folder)?;
         }
+        crate::path_security::harden_private_directory(&meeting_folder)
+            .map_err(anyhow::Error::msg)?;
 
         meeting_folder
     } else {
@@ -734,6 +740,7 @@ pub fn write_transcript_json_to_file(
     // Write JSON to file with pretty formatting
     let json_string = serde_json::to_string_pretty(&transcript_json)?;
     std::fs::write(&file_path, json_string)?;
+    crate::path_security::harden_private_file(&file_path).map_err(anyhow::Error::msg)?;
 
     Ok(file_path.to_string_lossy().to_string())
 }

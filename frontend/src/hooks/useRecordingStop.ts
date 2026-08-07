@@ -244,12 +244,8 @@ export function useRecordingStop(
         const folderPath = sessionStorage.getItem('last_recording_folder_path');
         const savedMeetingName = sessionStorage.getItem('last_recording_meeting_name');
 
-        console.log('💾 Saving COMPLETE transcripts to database...', {
+        console.log('💾 Saving complete transcripts to database:', {
           transcript_count: freshTranscripts.length,
-          meeting_name: savedMeetingName || meetingTitle,
-          folder_path: folderPath,
-          sample_text: freshTranscripts.length > 0 ? freshTranscripts[0].text.substring(0, 50) + '...' : 'none',
-          last_transcript: freshTranscripts.length > 0 ? freshTranscripts[freshTranscripts.length - 1].text.substring(0, 30) + '...' : 'none',
         });
 
         try {
@@ -291,7 +287,7 @@ export function useRecordingStop(
 
           console.log('✅ Successfully saved COMPLETE meeting with ID:', meetingId);
           console.log('   Transcripts:', freshTranscripts.length);
-          console.log('   folder_path:', folderPath);
+          console.log('Recording folder was provided:', Boolean(folderPath));
 
           // Mark meeting as saved in IndexedDB (for recovery system)
           await markMeetingAsSaved();
@@ -312,7 +308,6 @@ export function useRecordingStop(
                 id: meetingId,
                 title: meetingData.title
               });
-              console.log('✅ Current meeting set:', meetingData.title);
             }
           } catch (error) {
             console.warn('Could not fetch meeting details, using ID only:', error);

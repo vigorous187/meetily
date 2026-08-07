@@ -2,9 +2,9 @@ import React from 'react';
 import { Clock, Users, Calendar, Tag } from 'lucide-react';
 
 interface PageProps {
-  params: {
+  params: Promise<{
     id: string;
-  };
+  }>;
 }
 
 interface Note {
@@ -26,7 +26,8 @@ export function generateStaticParams() {
   ];
 }
 
-const NotePage = ({ params }: PageProps) => {
+const NotePage = async ({ params }: PageProps) => {
+  const { id } = await params;
   // This would normally come from your database
   const sampleData: Record<string, Note> = {
     'team-sync-dec-26': {
@@ -126,7 +127,7 @@ Quarterly product review session with stakeholders.
     }
   };
 
-  const note = sampleData[params.id as keyof typeof sampleData];
+  const note = sampleData[id as keyof typeof sampleData];
 
   if (!note) {
     return <div className="p-8">Note not found</div>;
@@ -171,16 +172,16 @@ Quarterly product review session with stakeholders.
       </div>
 
       <div className="prose prose-blue max-w-none">
-        <div dangerouslySetInnerHTML={{ __html: note.content.split('\n').map(line => {
+        <div>{note.content.trim().split('\n').map((line, index) => {
           if (line.startsWith('# ')) {
-            return `<h1>${line.slice(2)}</h1>`;
+            return <h1 key={index}>{line.slice(2)}</h1>;
           } else if (line.startsWith('## ')) {
-            return `<h2>${line.slice(3)}</h2>`;
+            return <h2 key={index}>{line.slice(3)}</h2>;
           } else if (line.startsWith('- ')) {
-            return `<li>${line.slice(2)}</li>`;
+            return <p key={index}>• {line.slice(2)}</p>;
           }
-          return line;
-        }).join('\n') }} />
+          return line ? <p key={index}>{line}</p> : <br key={index} />;
+        })}</div>
       </div>
     </div>
   );

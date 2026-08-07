@@ -2,7 +2,8 @@ use crate::whisper_engine::{ModelInfo, WhisperEngine};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use tauri::{command, Emitter, Manager, AppHandle, Runtime};
-use crate::config::WHISPER_MODEL_CATALOG;
+use crate::config::{whisper_model_sha256, WHISPER_MODEL_CATALOG};
+use crate::model_integrity::verify_sha256;
 
 // Global whisper engine
 pub static WHISPER_ENGINE: Mutex<Option<Arc<WhisperEngine>>> = Mutex::new(None);
@@ -66,13 +67,13 @@ pub async fn whisper_get_available_models() -> Result<Vec<ModelInfo>, String> {
     } else {
         // Fallback: scan models directory directly without initialized engine
         log::info!("Whisper engine not initialized, scanning models directory directly");
-        discover_models_standalone()
+        discover_models_standalone().await
     }
 }
 
 /// Discover Whisper models by scanning the models directory directly
 /// Used when the Whisper engine isn't initialized (e.g., when using Parakeet for live transcription)
-fn discover_models_standalone() -> Result<Vec<ModelInfo>, String> {
+async fn discover_models_standalone() -> Result<Vec<ModelInfo>, String> {
     use crate::whisper_engine::ModelStatus;
 
     let models_dir = get_models_directory()
@@ -95,7 +96,15 @@ fn discover_models_standalone() -> Result<Vec<ModelInfo>, String> {
                 Ok(metadata) => {
                     let file_size_mb = metadata.len() / (1024 * 1024);
                     if file_size_mb >= 1 {
-                        ModelStatus::Available
+                        match whisper_model_sha256(name) {
+                            Some(expected) if verify_sha256(&model_path, expected).await.is_ok() => {
+                                ModelStatus::Available
+                            }
+                            _ => ModelStatus::Corrupted {
+                                file_size: metadata.len(),
+                                expected_min_size: (size_mb as u64) * 1024 * 1024,
+                            },
+                        }
                     } else {
                         ModelStatus::Missing
                     }
@@ -556,6 +565,5 @@ pub async fn open_models_folder() -> Result<(), String> {
             .map_err(|e| format!("Failed to open folder: {}", e))?;
     }
 
-    log::info!("Opened models folder: {}", folder_path);
     Ok(())
 }

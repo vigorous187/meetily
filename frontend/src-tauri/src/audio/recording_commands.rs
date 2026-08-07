@@ -82,6 +82,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
+    if crate::dictation::is_active() {
+        return Err("Stop dictation before starting a meeting recording.".to_string());
+    }
+
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("🔍 IS_RECORDING state check: {}", current_recording_state);
@@ -275,6 +279,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
+                    speaker_id: Some(if update.source == "mic" { "you" } else { "remote" }.to_string()),
+                    source: update.source.clone(),
                 };
 
                 // Save to recording manager
@@ -327,6 +333,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     );
 
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+
+    if crate::dictation::is_active() {
+        return Err("Stop dictation before starting a meeting recording.".to_string());
+    }
 
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
@@ -446,6 +456,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
+                    speaker_id: Some(if update.source == "mic" { "you" } else { "remote" }.to_string()),
+                    source: update.source.clone(),
                 };
 
                 // Save to recording manager
@@ -821,7 +833,9 @@ pub async fn stop_recording<R: Runtime>(
         let meeting_name = manager.get_meeting_name();
 
         match tokio::time::timeout(
-            tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
+            // The diarization helper has its own five-minute limit which kills and reaps
+            // the child. Leave headroom so this outer timeout never cancels that cleanup.
+            tokio::time::Duration::from_secs(360),
             manager.save_recording_only(&app)
         ).await {
             Ok(Ok(_)) => {
@@ -835,7 +849,7 @@ pub async fn stop_recording<R: Runtime>(
                 // Don't fail shutdown - transcripts are already preserved
             }
             Err(_) => {
-                warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
+                warn!("⏱️ Local post-processing timeout reached during save, continuing shutdown");
                 // Don't fail shutdown - transcripts are already preserved
             }
         }
@@ -862,8 +876,6 @@ pub async fn stop_recording<R: Runtime>(
     };
 
     info!("📤 Preparing recording metadata for frontend save");
-    info!("   folder_path: {:?}", folder_path_str);
-    info!("   meeting_name: {:?}", meeting_name_str);
 
     // Database save removed - frontend will handle this after receiving all transcripts
     info!("ℹ️ Skipping database save in Rust - frontend will save after all transcripts received");
@@ -898,6 +910,15 @@ pub async fn stop_recording<R: Runtime>(
 
 /// Check if recording is active
 pub async fn is_recording() -> bool {
+    is_recording_active()
+}
+
+/// Synchronous recording-state check for non-async background monitors.
+///
+/// This is the same atomic state used by the recording commands. Keeping the
+/// check here prevents auxiliary features from drifting out of sync with the
+/// actual recording manager.
+pub fn is_recording_active() -> bool {
     IS_RECORDING.load(Ordering::SeqCst)
 }
 

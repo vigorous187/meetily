@@ -674,7 +674,6 @@ export class Analytics {
     }
 
     try {
-      console.log('Tracking transcription error event:', { errorMessage });
       await invoke('track_event', {
         eventName: 'transcription_error',
         properties: {

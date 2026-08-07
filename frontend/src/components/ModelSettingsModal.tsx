@@ -180,7 +180,12 @@ export function ModelSettingsModal({
     if (!url.trim()) return true; // Empty is valid (uses default)
     try {
       const parsed = new URL(url);
-      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      return parsed.protocol === 'http:' && (
+        parsed.hostname === 'localhost' ||
+        parsed.hostname === '127.0.0.1' ||
+        parsed.hostname === '::1' ||
+        parsed.hostname === '[::1]'
+      );
     } catch {
       return false;
     }
@@ -268,7 +273,7 @@ export function ModelSettingsModal({
           setModelConfig(data);
 
           // Fetch API key if not included in response and provider requires it
-          if (data.provider !== 'ollama' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && !data.apiKey) {
             try {
               const apiKeyData = await invoke('api_get_api_key', {
                 provider: data.provider
@@ -345,12 +350,6 @@ export function ModelSettingsModal({
   // Sync custom OpenAI state from modelConfig (context or props)
   useEffect(() => {
     if (modelConfig.provider === 'custom-openai') {
-      console.log('Syncing custom OpenAI fields from ConfigContext:', {
-        endpoint: modelConfig.customOpenAIEndpoint,
-        model: modelConfig.customOpenAIModel,
-        hasApiKey: !!modelConfig.customOpenAIApiKey,
-      });
-
       // Always sync from modelConfig (which comes from context if available)
       setCustomOpenAIEndpoint(modelConfig.customOpenAIEndpoint || '');
       setCustomOpenAIModel(modelConfig.customOpenAIModel || '');
@@ -651,7 +650,6 @@ export function ModelSettingsModal({
       model: modelConfig.provider === 'custom-openai' ? customOpenAIModel.trim() : modelConfig.model,
     };
     setModelConfig(updatedConfig);
-    console.log('ModelSettingsModal - handleSave - Updated ModelConfig:', updatedConfig);
 
     // Persist confirmed model choice to per-provider cache
     if (updatedConfig.model) {
@@ -875,12 +873,7 @@ export function ModelSettingsModal({
               </SelectTrigger>
               <SelectContent className="max-h-64 overflow-y-auto">
                 <SelectItem value="builtin-ai">Built-in AI (Offline, No API needed)</SelectItem>
-                <SelectItem value="claude">Claude</SelectItem>
-                <SelectItem value="custom-openai">Custom Server (OpenAI)</SelectItem>
-                <SelectItem value="groq">Groq</SelectItem>
                 <SelectItem value="ollama">Ollama</SelectItem>
-                <SelectItem value="openai">OpenAI</SelectItem>
-                <SelectItem value="openrouter">OpenRouter</SelectItem>
               </SelectContent>
             </Select>
 
@@ -1131,7 +1124,7 @@ export function ModelSettingsModal({
             {!isEndpointSectionCollapsed && (
               <>
                 <p className="text-sm text-muted-foreground mt-1 mb-2">
-                  Leave empty or enter a custom endpoint (e.g., http://x.yy.zz:11434)
+                  Leave empty or use a loopback endpoint (for example, http://localhost:11434).
                 </p>
                 <div className="flex gap-2 mt-1">
                   <div className="relative flex-1">

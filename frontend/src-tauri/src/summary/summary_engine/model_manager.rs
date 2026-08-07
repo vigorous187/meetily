@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 
 use super::models::{get_available_models, get_model_by_name};
+use crate::model_integrity::verify_sha256;
 
 // ============================================================================
 // Model Status Types
@@ -222,36 +223,35 @@ impl ModelManager {
             }
 
             let status = if model_path.exists() {
-                // Check if file size matches expected size (basic validation)
+                // Require the exact trusted file size and digest before loading.
                 match fs::metadata(&model_path).await {
                     Ok(metadata) => {
                         let file_size_mb = metadata.len() / (1024 * 1024);
 
-                        // Allow 10% variance for file size check
-                        let expected_min = (model_def.size_mb as f64 * 0.9) as u64;
-                        let expected_max = (model_def.size_mb as f64 * 1.1) as u64;
-
-                        log::info!(
-                            "Model '{}': found {} MB (expected {}-{} MB)",
-                            model_def.name,
-                            file_size_mb,
-                            expected_min,
-                            expected_max
-                        );
-
-                        if file_size_mb >= expected_min && file_size_mb <= expected_max {
-                            log::info!("Model '{}': AVAILABLE", model_def.name);
-                            ModelStatus::Available
+                        if metadata.len() == model_def.expected_size_bytes {
+                            match verify_sha256(&model_path, &model_def.expected_sha256).await {
+                                Ok(()) => {
+                                    log::info!("Model '{}': AVAILABLE (SHA-256 verified)", model_def.name);
+                                    ModelStatus::Available
+                                }
+                                Err(error) => {
+                                    log::error!("Model '{}': integrity verification failed: {}", model_def.name, error);
+                                    ModelStatus::Corrupted {
+                                        file_size: file_size_mb,
+                                        expected_min_size: model_def.size_mb,
+                                    }
+                                }
+                            }
                         } else {
                             log::warn!(
-                                "Model '{}': CORRUPTED (size mismatch: {} MB, expected {} MB)",
+                                "Model '{}': CORRUPTED (size mismatch: {} bytes, expected {} bytes)",
                                 model_def.name,
-                                file_size_mb,
-                                model_def.size_mb
+                                metadata.len(),
+                                model_def.expected_size_bytes
                             );
                             ModelStatus::Corrupted {
                                 file_size: file_size_mb,
-                                expected_min_size: expected_min,
+                                expected_min_size: model_def.size_mb,
                             }
                         }
                     }
@@ -393,15 +393,12 @@ impl ModelManager {
         // Check if model already exists and is valid (skip re-download)
         if file_path.exists() {
             if let Ok(metadata) = fs::metadata(&file_path).await {
-                let file_size_mb = metadata.len() / (1024 * 1024);
-                let expected_min = (model_def.size_mb as f64 * 0.9) as u64;
-                let expected_max = (model_def.size_mb as f64 * 1.1) as u64;
-
-                if file_size_mb >= expected_min && file_size_mb <= expected_max {
+                if metadata.len() == model_def.expected_size_bytes
+                    && verify_sha256(&file_path, &model_def.expected_sha256).await.is_ok()
+                {
                     log::info!(
-                        "Model '{}' already exists and is valid ({} MB), skipping download",
+                        "Model '{}' already exists and is cryptographically verified, skipping download",
                         model_name,
-                        file_size_mb
                     );
 
                     // Update status to available
@@ -425,14 +422,14 @@ impl ModelManager {
                     }
 
                     return Ok(());
-                } else if file_size_mb > expected_max {
+                } else if metadata.len() >= model_def.expected_size_bytes {
                     // File is LARGER than expected - possibly corrupted or wrong file
                     // Delete and re-download in this case
                     log::warn!(
                         "Model '{}' exists but is too large ({} MB, expected max {} MB), deleting and re-downloading",
                         model_name,
-                        file_size_mb,
-                        expected_max
+                        metadata.len(),
+                        model_def.expected_size_bytes
                     );
                     if let Err(e) = fs::remove_file(&file_path).await {
                         log::warn!("Failed to delete oversized model file: {}", e);
@@ -443,8 +440,8 @@ impl ModelManager {
                     log::info!(
                         "Model '{}' exists but is incomplete ({} MB, expected min {} MB), will resume download",
                         model_name,
-                        file_size_mb,
-                        expected_min
+                        metadata.len(),
+                        model_def.expected_size_bytes
                     );
                     // Continue to download/resume logic below
                 }
@@ -452,7 +449,6 @@ impl ModelManager {
         }
 
         log::info!("Downloading from: {}", model_def.download_url);
-        log::info!("Saving to: {}", file_path.display());
 
         // Create models directory if needed
         if !self.models_dir.exists() {
@@ -730,6 +726,20 @@ impl ModelManager {
         // Small delay to ensure UI receives 100% event
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+        if let Err(e) = verify_sha256(&file_path, &model_def.expected_sha256).await {
+            log::error!("Downloaded model failed SHA-256 verification: {}", e);
+            let _ = fs::remove_file(&file_path).await;
+            {
+                let mut models = self.available_models.write().await;
+                if let Some(model_info) = models.get_mut(model_name) {
+                    model_info.status = ModelStatus::Error("Downloaded model failed integrity verification".to_string());
+                }
+            }
+            let mut active = self.active_downloads.write().await;
+            active.remove(model_name);
+            return Err(anyhow!("Downloaded model failed integrity verification: {}", e));
+        }
+
         if let Err(e) = self.validate_gguf_file(&file_path).await {
             log::error!("Downloaded file failed validation: {}", e);
 
@@ -830,7 +840,6 @@ impl ModelManager {
 
         if file_path.exists() {
             fs::remove_file(&file_path).await?;
-            log::info!("Deleted model file: {}", file_path.display());
         }
 
         // Update status

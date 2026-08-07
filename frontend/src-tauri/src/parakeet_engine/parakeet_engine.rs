@@ -9,6 +9,23 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
+use crate::model_integrity::verify_sha256;
+
+const PARAKEET_V2_REVISION: &str = "0bbb45a3365852604aef28b538a8f066f4ccaa85";
+
+fn parakeet_file_sha256(model_name: &str, filename: &str) -> Option<&'static str> {
+    match (model_name, filename) {
+        ("parakeet-tdt-0.6b-v2-int8", "encoder-model.int8.onnx") => Some("3e0581fda6ab843888b51e56d7ee78b6d5bc3237ec113af1f732d1d5286aa155"),
+        ("parakeet-tdt-0.6b-v2-int8", "decoder_joint-model.int8.onnx") => Some("a449f49acd68979d418651dd2dcb737cc0f1bf0225e009e29ee326354edbf7d3"),
+        ("parakeet-tdt-0.6b-v2-int8", "nemo128.onnx") => Some("a9fde1486ebfcc08f328d75ad4610c67835fea58c73ba57e3209a6f6cf019e9f"),
+        ("parakeet-tdt-0.6b-v2-int8", "vocab.txt") => Some("ec182b70dd42113aff6c5372c75cac58c952443eb22322f57bbd7f53977d497d"),
+        ("parakeet-tdt-0.6b-v3-int8", "encoder-model.int8.onnx") => Some("6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09"),
+        ("parakeet-tdt-0.6b-v3-int8", "decoder_joint-model.int8.onnx") => Some("eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70"),
+        ("parakeet-tdt-0.6b-v3-int8", "nemo128.onnx") => Some("a9fde1486ebfcc08f328d75ad4610c67835fea58c73ba57e3209a6f6cf019e9f"),
+        ("parakeet-tdt-0.6b-v3-int8", "vocab.txt") => Some("d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"),
+        _ => None,
+    }
+}
 
 /// Quantization type for Parakeet models
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -211,7 +228,7 @@ impl ParakeetEngine {
 
                 if all_files_exist {
                     // Validate model by checking file sizes
-                    match self.validate_model_directory(&model_path).await {
+                    match self.validate_model_directory(name, &model_path).await {
                         Ok(_) => ModelStatus::Available,
                         Err(_) => {
                             log::warn!("Model directory {} appears corrupted", name);
@@ -259,7 +276,7 @@ impl ParakeetEngine {
     }
 
     /// Validate model directory by checking if all required files exist AND have valid sizes
-    async fn validate_model_directory(&self, model_dir: &PathBuf) -> Result<()> {
+    async fn validate_model_directory(&self, model_name: &str, model_dir: &PathBuf) -> Result<()> {
         // Check if vocab.txt exists and is readable
         let vocab_path = model_dir.join("vocab.txt");
         if !vocab_path.exists() {
@@ -320,6 +337,10 @@ impl ParakeetEngine {
                     return Err(anyhow!("Failed to read {} metadata: {}", filename, e));
                 }
             }
+
+            let expected_sha256 = parakeet_file_sha256(model_name, filename)
+                .ok_or_else(|| anyhow!("No trusted hash configured for {}/{}", model_name, filename))?;
+            verify_sha256(&file_path, expected_sha256).await?;
         }
 
         Ok(())
@@ -327,13 +348,13 @@ impl ParakeetEngine {
 
     /// Clean incomplete model directory before download
     /// Removes all files if directory exists but model is not Available
-    async fn clean_incomplete_model_directory(&self, model_dir: &PathBuf) -> Result<()> {
+    async fn clean_incomplete_model_directory(&self, model_name: &str, model_dir: &PathBuf) -> Result<()> {
         if !model_dir.exists() {
             return Ok(()); // Nothing to clean
         }
 
         // Validate the directory
-        match self.validate_model_directory(model_dir).await {
+        match self.validate_model_directory(model_name, model_dir).await {
             Ok(_) => {
                 log::info!("Model directory is valid, no cleanup needed");
                 return Ok(());
@@ -451,11 +472,15 @@ impl ParakeetEngine {
     }
 
     /// Transcribe audio samples using the loaded Parakeet model
-    pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
+    pub async fn transcribe_audio(&self, mut audio_data: Vec<f32>) -> Result<String> {
         let mut model_guard = self.current_model.write().await;
-        let model = model_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("No Parakeet model loaded. Please load a model first."))?;
+        let model = match model_guard.as_mut() {
+            Some(model) => model,
+            None => {
+                crate::dictation::zeroize_owned_audio(&mut audio_data);
+                return Err(anyhow!("No Parakeet model loaded. Please load a model first."));
+            }
+        };
 
         let duration_seconds = audio_data.len() as f64 / 16000.0; // Assuming 16kHz
         log::debug!(
@@ -469,7 +494,10 @@ impl ParakeetEngine {
             .transcribe_samples(audio_data)
             .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
 
-        log::debug!("Parakeet transcription result: '{}'", result.text);
+        log::debug!(
+            "Parakeet transcription produced {} characters",
+            result.text.len()
+        );
 
         Ok(result.text)
     }
@@ -592,10 +620,13 @@ impl ParakeetEngine {
 
         // HuggingFace base URL for Parakeet models (version-specific)
         let base_url = if model_name.contains("-v2-") {
-            "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/main"
+            format!(
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/{}",
+                PARAKEET_V2_REVISION
+            )
         } else {
             // Default to v3 for v3 models
-            "https://meetily.towardsgeneralintelligence.com/models/parakeet-tdt-0.6b-v3-onnx"
+            "https://meetily.towardsgeneralintelligence.com/models/parakeet-tdt-0.6b-v3-onnx".to_string()
         };
 
         // Determine which files to download based on quantization
@@ -627,7 +658,7 @@ impl ParakeetEngine {
 
         // Clean up incomplete downloads before starting
         log::info!("Checking for incomplete model files to clean up...");
-        if let Err(e) = self.clean_incomplete_model_directory(model_dir).await {
+        if let Err(e) = self.clean_incomplete_model_directory(model_name, model_dir).await {
             log::warn!("Failed to clean incomplete model directory: {}", e);
             // Continue anyway - we'll handle errors during download
         }
@@ -717,7 +748,7 @@ impl ParakeetEngine {
             let file_path = model_dir.join(filename);
 
             // Check for existing partial file to resume
-            let existing_size: u64 = if file_path.exists() {
+            let mut existing_size: u64 = if file_path.exists() {
                 fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0)
             } else {
                 0
@@ -725,16 +756,20 @@ impl ParakeetEngine {
 
             let expected_size = file_sizes.get(*filename).copied().unwrap_or(0);
 
-            // Skip if file is already complete (with 1% tolerance for size variations)
+            let expected_sha256 = parakeet_file_sha256(model_name, filename)
+                .ok_or_else(|| anyhow!("No trusted hash configured for {}/{}", model_name, filename))?;
+
+            // Skip only files that pass the pinned digest check.
             let size_tolerance = (expected_size as f64 * 0.99) as u64;
             if existing_size >= size_tolerance && expected_size > 0 {
-                log::info!(
-                    "Skipping complete file: {} ({:.2} MB, expected: {:.2} MB)",
-                    filename,
-                    existing_size as f64 / 1_048_576.0,
-                    expected_size as f64 / 1_048_576.0
-                );
-                continue;
+                if verify_sha256(&file_path, expected_sha256).await.is_ok() {
+                    log::info!("Skipping cryptographically verified file: {}", filename);
+                    continue;
+                }
+                log::warn!("Existing file {} failed integrity verification; replacing it", filename);
+                fs::remove_file(&file_path).await
+                    .map_err(|e| anyhow!("Failed to remove invalid file {}: {}", filename, e))?;
+                existing_size = 0;
             }
 
             log::info!("Downloading file {}/{}: {} (resuming from {} bytes)", index + 1, total_files, filename, existing_size);
@@ -768,9 +803,10 @@ impl ParakeetEngine {
                 log::warn!("Server returned 416 Range Not Satisfiable for {}", filename);
 
                 let size_tolerance = (expected_size as f64 * 0.99) as u64;
-                if existing_size >= size_tolerance && expected_size > 0 {
-                    // File is complete - skip it
-                    log::info!("File {} complete ({} bytes). Skipping.", filename, existing_size);
+                if existing_size >= size_tolerance && expected_size > 0
+                    && verify_sha256(&file_path, expected_sha256).await.is_ok()
+                {
+                    log::info!("File {} is complete and cryptographically verified. Skipping.", filename);
                     continue;
                 } else {
                     // File incomplete but server won't accept range - delete and retry
@@ -999,6 +1035,22 @@ impl ParakeetEngine {
 
                 return Err(anyhow!("Failed to flush file {}: {}", filename, e));
             }
+            drop(writer);
+
+            if let Err(error) = verify_sha256(&file_path, expected_sha256).await {
+                let _ = fs::remove_file(&file_path).await;
+                {
+                    let mut active = self.active_downloads.write().await;
+                    active.remove(model_name);
+                }
+                {
+                    let mut models = self.available_models.write().await;
+                    if let Some(model) = models.get_mut(model_name) {
+                        model.status = ModelStatus::Error("Downloaded model failed integrity verification".to_string());
+                    }
+                }
+                return Err(anyhow!("Downloaded file {} failed integrity verification: {}", filename, error));
+            }
 
             log::info!(
                 "Completed download: {} ({:.2} MB, overall progress: {:.1}%)",
@@ -1007,6 +1059,8 @@ impl ParakeetEngine {
                 (total_downloaded as f64 / total_size_bytes as f64) * 100.0
             );
         }
+
+        self.validate_model_directory(model_name, model_dir).await?;
 
         // Report 100% progress with final speed
         let total_elapsed = download_start_time.elapsed().as_secs_f64();

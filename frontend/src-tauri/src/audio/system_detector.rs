@@ -355,7 +355,7 @@ impl MacOSSystemAudioDetector {
 }
 
 #[cfg(target_os = "macos")]
-fn list_system_audio_using_apps() -> Vec<String> {
+pub(crate) fn list_system_audio_using_apps() -> Vec<String> {
     match ca::System::processes() {
         Ok(processes) => {
             let mut apps = Vec::new();

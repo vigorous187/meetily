@@ -1,0 +1,6 @@
+[env]
+# ort-sys 2.0.0-rc.10 returns an empty linker search path when Cargo is
+# offline unless ORT_LIB_LOCATION is explicit. Use the reviewed, vendored
+# static archive and forbid its downloader in every workspace invocation.
+ORT_LIB_LOCATION = { value = "frontend/src-tauri/vendor/onnxruntime/aarch64-apple-darwin", relative = true, force = true }
+ORT_SKIP_DOWNLOAD = { value = "true", force = true }

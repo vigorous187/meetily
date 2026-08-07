@@ -3,7 +3,7 @@
 import { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, Download, FolderOpen, RefreshCw } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -11,7 +11,9 @@ import { useConfig } from '@/contexts/ConfigContext';
 
 interface TranscriptButtonGroupProps {
   transcriptCount: number;
+  hasExportableContent?: boolean;
   onCopyTranscript: () => void;
+  onExportMeeting: () => Promise<void>;
   onOpenMeetingFolder: () => Promise<void>;
   meetingId?: string;
   meetingFolderPath?: string | null;
@@ -21,7 +23,9 @@ interface TranscriptButtonGroupProps {
 
 export function TranscriptButtonGroup({
   transcriptCount,
+  hasExportableContent = transcriptCount > 0,
   onCopyTranscript,
+  onExportMeeting,
   onOpenMeetingFolder,
   meetingId,
   meetingFolderPath,
@@ -52,6 +56,20 @@ export function TranscriptButtonGroup({
         >
           <Copy />
           <span className="hidden lg:inline">Copy</span>
+        </Button>
+
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            Analytics.trackButtonClick('export_meeting_markdown', 'meeting_details');
+            void onExportMeeting();
+          }}
+          disabled={!hasExportableContent}
+          title={!hasExportableContent ? 'No meeting content available' : 'Export complete meeting as Markdown'}
+        >
+          <Download />
+          <span className="hidden lg:inline">Export</span>
         </Button>
 
         <Button

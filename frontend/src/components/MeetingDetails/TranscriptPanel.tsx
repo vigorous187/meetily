@@ -3,6 +3,8 @@
 import { Transcript, TranscriptSegmentData } from '@/types';
 import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { useMemo } from 'react';
 
@@ -11,6 +13,8 @@ interface TranscriptPanelProps {
   customPrompt: string;
   onPromptChange: (value: string) => void;
   onCopyTranscript: () => void;
+  onExportMeeting: () => Promise<void>;
+  hasExportableContent?: boolean;
   onOpenMeetingFolder: () => Promise<void>;
   isRecording: boolean;
   disableAutoScroll?: boolean;
@@ -35,6 +39,8 @@ export function TranscriptPanel({
   customPrompt,
   onPromptChange,
   onCopyTranscript,
+  onExportMeeting,
+  hasExportableContent,
   onOpenMeetingFolder,
   isRecording,
   disableAutoScroll = false,
@@ -49,6 +55,17 @@ export function TranscriptPanel({
   meetingFolderPath,
   onRefetchTranscripts,
 }: TranscriptPanelProps) {
+  const renameSpeaker = async (speakerId: string, currentName: string) => {
+    const displayName = window.prompt('Speaker name', currentName)?.trim();
+    if (!displayName || displayName === currentName || !meetingId) return;
+    try {
+      await invoke('api_rename_meeting_speaker', { meetingId, speakerId, displayName });
+      await onRefetchTranscripts?.();
+      toast.success('Speaker renamed');
+    } catch (error) {
+      toast.error(String(error));
+    }
+  };
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
     if (usePagination && segments) {
@@ -61,6 +78,9 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      source: t.source,
+      speakerId: t.speaker_id,
+      speakerName: t.speaker_name,
     }));
   }, [transcripts, usePagination, segments]);
 
@@ -70,7 +90,9 @@ export function TranscriptPanel({
       <div className="p-4 border-b border-gray-200">
         <TranscriptButtonGroup
           transcriptCount={usePagination ? (totalCount ?? convertedSegments.length) : (transcripts?.length || 0)}
+          hasExportableContent={hasExportableContent}
           onCopyTranscript={onCopyTranscript}
+          onExportMeeting={onExportMeeting}
           onOpenMeetingFolder={onOpenMeetingFolder}
           meetingId={meetingId}
           meetingFolderPath={meetingFolderPath}
@@ -94,6 +116,7 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          onRenameSpeaker={renameSpeaker}
         />
       </div>
 

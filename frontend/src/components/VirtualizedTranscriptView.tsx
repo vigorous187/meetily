@@ -34,6 +34,7 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+    onRenameSpeaker?: (speakerId: string, currentName: string) => void;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -69,6 +70,10 @@ const TranscriptSegment = memo(function TranscriptSegment({
     timestamp,
     text,
     confidence,
+    source,
+    speakerName,
+    speakerId,
+    onRenameSpeaker,
     isStreaming,
     showConfidence,
 }: {
@@ -76,6 +81,10 @@ const TranscriptSegment = memo(function TranscriptSegment({
     timestamp: number;
     text: string;
     confidence?: number;
+    source?: 'mic' | 'system' | 'unknown';
+    speakerName?: string;
+    speakerId?: string;
+    onRenameSpeaker?: (speakerId: string, currentName: string) => void;
     isStreaming: boolean;
     showConfidence: boolean;
 }) {
@@ -97,6 +106,17 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
+                    {(speakerName || source === 'mic' || source === 'system') && (
+                        <button
+                            type="button"
+                            disabled={!speakerId || !onRenameSpeaker}
+                            onClick={() => speakerId && onRenameSpeaker?.(speakerId, speakerName ?? 'Speaker')}
+                            className="mb-0.5 text-xs font-semibold text-gray-500 disabled:cursor-default hover:enabled:text-blue-600"
+                            title={speakerId && onRenameSpeaker ? 'Rename speaker' : undefined}
+                        >
+                            {speakerName ?? (source === 'mic' ? 'You' : 'Remote speaker')}
+                        </button>
+                    )}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -124,6 +144,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onRenameSpeaker,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -294,6 +315,10 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        source={segment.source}
+                                        speakerName={segment.speakerName}
+                                        speakerId={segment.speakerId}
+                                        onRenameSpeaker={onRenameSpeaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />
@@ -350,6 +375,10 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        source={segment.source}
+                                        speakerName={segment.speakerName}
+                                        speakerId={segment.speakerId}
+                                        onRenameSpeaker={onRenameSpeaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />

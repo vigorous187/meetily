@@ -98,5 +98,7 @@ pub fn encode_single_audio(
         ));
     }
 
+    crate::path_security::harden_private_file(output_path).map_err(anyhow::Error::msg)?;
+
     Ok(())
 }

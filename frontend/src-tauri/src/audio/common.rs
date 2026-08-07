@@ -63,6 +63,8 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> 
                 audio_start_time: Some(start_seconds),
                 audio_end_time: Some(end_seconds),
                 duration: Some(duration),
+                source: "unknown".to_string(),
+                speaker_id: None,
             }
         })
         .collect()
@@ -92,7 +94,9 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
 
     let json_string = serde_json::to_string_pretty(&json)?;
     std::fs::write(&temp_path, &json_string)?;
+    crate::path_security::harden_private_file(&temp_path).map_err(anyhow::Error::msg)?;
     std::fs::rename(&temp_path, &transcript_path)?;
+    crate::path_security::harden_private_file(&transcript_path).map_err(anyhow::Error::msg)?;
 
     info!(
         "Wrote transcripts.json with {} segments to {}",

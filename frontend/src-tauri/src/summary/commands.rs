@@ -1,14 +1,12 @@
 use crate::database::repositories::{
-    meeting::MeetingsRepository,
-    summary::SummaryProcessesRepository, transcript_chunk::TranscriptChunksRepository,
+    meeting::MeetingsRepository, summary::SummaryProcessesRepository,
+    transcript_chunk::TranscriptChunksRepository,
 };
 use crate::state::AppState;
+use crate::summary::language_detection::{detect_summary_language, SummaryLanguageDetection};
 use crate::summary::metadata::{
     read_detected_summary_language_from_metadata, read_summary_language_from_metadata,
     write_detected_summary_language_to_metadata, write_summary_language_to_metadata,
-};
-use crate::summary::language_detection::{
-    detect_summary_language, SummaryLanguageDetection,
 };
 use crate::summary::service::SummaryService;
 use log::{error as log_error, info as log_info, warn as log_warn};
@@ -22,6 +20,8 @@ pub struct SummaryResponse {
     #[serde(rename = "meetingName")]
     pub meeting_name: Option<String>,
     pub meeting_id: String,
+    #[serde(rename = "processId")]
+    pub process_id: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
     pub data: Option<serde_json::Value>,
@@ -88,6 +88,7 @@ pub async fn api_save_meeting_summary<R: Runtime>(
 
     match SummaryProcessesRepository::update_meeting_summary(pool, &meeting_id, &summary).await {
         Ok(true) => {
+            SummaryService::supersede_generation(&meeting_id);
             log_info!("Summary saved successfully for meeting_id: {}", meeting_id);
             Ok(serde_json::json!({
                 "message": "Meeting summary saved successfully"
@@ -166,9 +167,11 @@ pub async fn api_get_meeting_detected_summary_language<R: Runtime>(
     );
 
     match resolve_meeting_folder(state.db_manager.pool(), &meeting_id).await? {
-        MeetingFolderResolution::Folder(folder) => read_detected_summary_language_from_metadata(&folder)
-            .map(MeetingSummaryLanguagePreference::metadata)
-            .map_err(|e| e.to_string()),
+        MeetingFolderResolution::Folder(folder) => {
+            read_detected_summary_language_from_metadata(&folder)
+                .map(MeetingSummaryLanguagePreference::metadata)
+                .map_err(|e| e.to_string())
+        }
         MeetingFolderResolution::NoFolder => Ok(MeetingSummaryLanguagePreference::local_fallback()),
     }
 }
@@ -189,8 +192,11 @@ pub async fn api_save_meeting_detected_summary_language<R: Runtime>(
 
     match resolve_meeting_folder(state.db_manager.pool(), &meeting_id).await? {
         MeetingFolderResolution::Folder(folder) => {
-            write_detected_summary_language_to_metadata(&folder, detected_summary_language.as_deref())
-                .map_err(|e| e.to_string())?;
+            write_detected_summary_language_to_metadata(
+                &folder,
+                detected_summary_language.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
             read_detected_summary_language_from_metadata(&folder)
                 .map(MeetingSummaryLanguagePreference::metadata)
                 .map_err(|e| e.to_string())
@@ -231,6 +237,7 @@ pub async fn api_get_summary<R: Runtime>(
     _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
+    process_id: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<SummaryResponse, String> {
     log_info!(
@@ -241,6 +248,26 @@ pub async fn api_get_summary<R: Runtime>(
 
     match SummaryProcessesRepository::get_summary_data_for_meeting(pool, &meeting_id).await {
         Ok(Some(process)) => {
+            if process_id
+                .as_deref()
+                .is_some_and(|requested| process.generation_id.as_deref() != Some(requested))
+            {
+                let meeting_name = MeetingsRepository::get_meeting(pool, &meeting_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|meeting| meeting.title);
+                return Ok(SummaryResponse {
+                    status: "superseded".to_string(),
+                    meeting_name,
+                    meeting_id,
+                    process_id,
+                    start: None,
+                    end: None,
+                    data: None,
+                    error: Some("A newer summary generation replaced this one.".to_string()),
+                });
+            }
             let status = process.status.to_lowercase();
             let error = process.error;
 
@@ -260,10 +287,7 @@ pub async fn api_get_summary<R: Runtime>(
 
             // Fetch meeting title from database
             let meeting_name = match MeetingsRepository::get_meeting(pool, &meeting_id).await {
-                Ok(Some(meeting_details)) => {
-                    log_info!("Fetched meeting title: {}", &meeting_details.title);
-                    Some(meeting_details.title)
-                }
+                Ok(Some(meeting_details)) => Some(meeting_details.title),
                 Ok(None) => {
                     log_warn!("Meeting not found for meeting_id: {}", meeting_id);
                     None
@@ -278,6 +302,7 @@ pub async fn api_get_summary<R: Runtime>(
                 status: status.clone(),
                 meeting_name,
                 meeting_id: meeting_id.clone(),
+                process_id: process.generation_id,
                 start: process.start_time.map(|t| t.to_rfc3339()),
                 end: process.end_time.map(|t| t.to_rfc3339()),
                 data,
@@ -306,6 +331,7 @@ pub async fn api_get_summary<R: Runtime>(
                 status: "idle".to_string(),
                 meeting_name,
                 meeting_id,
+                process_id,
                 start: None,
                 end: None,
                 data: None,
@@ -353,15 +379,12 @@ pub async fn api_process_transcript<R: Runtime>(
     // Normalise empty / whitespace-only to None so "" and null behave identically
     let summary_language = summary_language.and_then(|s| {
         let t = s.trim();
-        if t.is_empty() { None } else { Some(t.to_string()) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
     });
-
-    // Create or reset the process entry in the database
-    SummaryProcessesRepository::create_or_reset_process(&pool, &m_id)
-        .await
-        .map_err(|e| format!("Failed to initialize process: {}", e))?;
-
-    log_info!("✓ Summary process initialized for meeting_id: {}", &m_id);
 
     // Save transcript chunks data (matching Python backend behavior)
     let chunk_size = _chunk_size.unwrap_or(40000);
@@ -381,13 +404,28 @@ pub async fn api_process_transcript<R: Runtime>(
 
     log_info!("✓ Transcript chunks saved for meeting_id: {}", &m_id);
 
+    let process_id = Uuid::new_v4().to_string();
+    SummaryProcessesRepository::create_or_reset_process(&pool, &m_id, &process_id)
+        .await
+        .map_err(|e| format!("Failed to initialize process: {}", e))?;
+    let cancellation_token = SummaryService::register_generation(&m_id, &process_id);
+
+    log_info!(
+        "Summary process {} initialized for meeting_id: {}",
+        process_id,
+        &m_id
+    );
+
     // Spawn background task for actual processing
     let meeting_id_clone = m_id.clone();
+    let process_id_clone = process_id.clone();
     tauri::async_runtime::spawn(async move {
         SummaryService::process_transcript_background(
             app,
             pool,
             meeting_id_clone.clone(),
+            process_id_clone,
+            cancellation_token,
             text,
             model,
             model_name,
@@ -402,7 +440,7 @@ pub async fn api_process_transcript<R: Runtime>(
 
     Ok(ProcessTranscriptResponse {
         message: "Summary generation started".to_string(),
-        process_id: m_id,
+        process_id,
     })
 }
 
@@ -415,27 +453,56 @@ pub async fn api_cancel_summary<R: Runtime>(
     _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
+    process_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!("api_cancel_summary called for meeting_id: {}", meeting_id);
 
     // Trigger cancellation via the service
-    let cancelled = SummaryService::cancel_summary(&meeting_id);
+    let cancelled = SummaryService::cancel_summary(&meeting_id, process_id.as_deref());
 
-    if cancelled {
+    if let Some(cancelled_process_id) = cancelled {
         // Update database status to cancelled
         let pool = state.db_manager.pool();
-        if let Err(e) = SummaryProcessesRepository::update_process_cancelled(pool, &meeting_id).await {
-            log_error!("Failed to update DB status to cancelled for {}: {}", meeting_id, e);
-            return Err(format!("Failed to update cancellation status: {}", e));
+        match SummaryProcessesRepository::update_process_cancelled(
+            pool,
+            &meeting_id,
+            &cancelled_process_id,
+        )
+        .await
+        {
+            Err(e) => {
+                log_error!(
+                    "Failed to update DB status to cancelled for {}: {}",
+                    meeting_id,
+                    e
+                );
+                return Err(format!("Failed to update cancellation status: {}", e));
+            }
+            Ok(false) => {
+                return Ok(serde_json::json!({
+                    "message": "The requested summary generation is no longer active",
+                    "meeting_id": meeting_id,
+                    "process_id": cancelled_process_id,
+                    "status": "superseded"
+                }));
+            }
+            Ok(true) => {}
         }
 
-        log_info!("Successfully cancelled summary generation for meeting_id: {}", meeting_id);
+        log_info!(
+            "Successfully cancelled summary generation for meeting_id: {}",
+            meeting_id
+        );
         Ok(serde_json::json!({
             "message": "Summary generation cancelled successfully",
             "meeting_id": meeting_id,
+            "process_id": cancelled_process_id,
         }))
     } else {
-        log_warn!("No active summary generation found for meeting_id: {}", meeting_id);
+        log_warn!(
+            "No active summary generation found for meeting_id: {}",
+            meeting_id
+        );
         Ok(serde_json::json!({
             "message": "No active summary generation to cancel",
             "meeting_id": meeting_id,

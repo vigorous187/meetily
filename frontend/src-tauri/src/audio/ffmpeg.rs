@@ -1,12 +1,11 @@
-use ffmpeg_sidecar::{
-    command::ffmpeg_is_installed,
-    download::{check_latest_version, download_ffmpeg_package, ffmpeg_download_url, unpack_ffmpeg},
-    paths::sidecar_dir,
-    version::ffmpeg_version,
-};
 use log::{debug, error};
 use once_cell::sync::Lazy;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+#[cfg(debug_assertions)]
 use which::which;
 
 #[cfg(not(windows))]
@@ -17,216 +16,245 @@ const EXECUTABLE_NAME: &str = "ffmpeg.exe";
 
 static FFMPEG_PATH: Lazy<Option<PathBuf>> = Lazy::new(find_ffmpeg_path_internal);
 
+#[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
+const PACKAGED_FFMPEG_SIZE: u64 = 22_057_536;
+#[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
+const PACKAGED_FFMPEG_SHA256: &str =
+    "9547d85ee85eb7d9480c517c9e224d739780e3f2c9e251e5fb585a1ffdcc5437";
+
 pub fn find_ffmpeg_path() -> Option<PathBuf> {
-    FFMPEG_PATH.as_ref().map(|p| p.clone())
+    let path = FFMPEG_PATH.as_ref()?.clone();
+    if verify_ffmpeg_before_spawn(&path) {
+        Some(path)
+    } else {
+        error!("Bundled ffmpeg failed packaged size or SHA-256 verification");
+        None
+    }
 }
 
-fn find_ffmpeg_path_internal() -> Option<PathBuf> {
-    debug!("Starting search for ffmpeg executable");
-
-    // ============================================================
-    // PRIORITY 1: Bundled Binary (Production)
-    // ============================================================
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_folder) = exe_path.parent() {
-            let bundled = exe_folder.join(EXECUTABLE_NAME);
-            if bundled.exists() && bundled.is_file() {
-                debug!("Found bundled ffmpeg: {:?}", bundled);
-                return Some(bundled);
-            }
-        }
-    }
-
-
-    // ============================================================
-    // PRIORITY 2: Fallback to Existing Logic
-    // ============================================================
-
-    // Check if `ffmpeg` is in the PATH environment variable
-    if let Ok(path) = which(EXECUTABLE_NAME) {
-        debug!("Found ffmpeg in PATH: {:?}", path);
-        return Some(path);
-    }
-    debug!("ffmpeg not found in PATH");
-
-    // Check in $HOME/.local/bin on macOS
-    #[cfg(target_os = "macos")]
+fn file_matches(path: &Path, expected_size: u64, expected_sha256: &str) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected_size
     {
-        if let Ok(home) = std::env::var("HOME") {
-            let local_bin = PathBuf::from(home).join(".local").join("bin");
-            debug!("Checking $HOME/.local/bin: {:?}", local_bin);
-            let ffmpeg_in_local_bin = local_bin.join(EXECUTABLE_NAME);
-            if ffmpeg_in_local_bin.exists() {
-                debug!("Found ffmpeg in $HOME/.local/bin: {:?}", ffmpeg_in_local_bin);
-                return Some(ffmpeg_in_local_bin);
-            }
-            debug!("ffmpeg not found in $HOME/.local/bin");
-        }
+        return false;
     }
-
-    // Check in current working directory
-    if let Ok(cwd) = std::env::current_dir() {
-        debug!("Current working directory: {:?}", cwd);
-        let ffmpeg_in_cwd = cwd.join(EXECUTABLE_NAME);
-        if ffmpeg_in_cwd.is_file() && ffmpeg_in_cwd.exists() {
-            debug!(
-                "Found ffmpeg in current working directory: {:?}",
-                ffmpeg_in_cwd
-            );
-            return Some(ffmpeg_in_cwd);
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let Ok(count) = file.read(&mut buffer) else {
+            return false;
+        };
+        if count == 0 {
+            break;
         }
-        debug!("ffmpeg not found in current working directory");
+        hasher.update(&buffer[..count]);
     }
+    format!("{:x}", hasher.finalize()) == expected_sha256
+}
 
-    // Check in the same folder as the executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_folder) = exe_path.parent() {
-            debug!("Executable folder: {:?}", exe_folder);
+fn verify_ffmpeg_before_spawn(path: &Path) -> bool {
+    #[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
+    return file_matches(path, PACKAGED_FFMPEG_SIZE, PACKAGED_FFMPEG_SHA256);
 
-            // Platform-specific checks
-            #[cfg(target_os = "macos")]
-            {
-                let resources_folder = exe_folder.join("../Resources");
-                debug!("Resources folder: {:?}", resources_folder);
-                let ffmpeg_in_resources = resources_folder.join(EXECUTABLE_NAME);
-                if ffmpeg_in_resources.exists() {
-                    debug!(
-                        "Found ffmpeg in Resources folder: {:?}",
-                        ffmpeg_in_resources
-                    );
-                    return Some(ffmpeg_in_resources);
-                }
-                debug!("ffmpeg not found in Resources folder");
-            }
+    #[cfg(all(not(debug_assertions), not(all(target_os = "macos", target_arch = "aarch64"))))]
+    return false;
 
-            #[cfg(target_os = "linux")]
-            {
-                let lib_folder = exe_folder.join("lib");
-                debug!("Lib folder: {:?}", lib_folder);
-                let ffmpeg_in_lib = lib_folder.join(EXECUTABLE_NAME);
-                if ffmpeg_in_lib.exists() {
-                    debug!("Found ffmpeg in lib folder: {:?}", ffmpeg_in_lib);
-                    return Some(ffmpeg_in_lib);
-                }
-                debug!("ffmpeg not found in lib folder");
-            }
-        }
+    #[cfg(debug_assertions)]
+    {
+        let _ = path;
+        true
     }
+}
 
-    debug!("ffmpeg not found. installing...");
+/// Resolve a bundled sidecar only when it is an executable regular file located
+/// directly beside the application executable. This intentionally rejects
+/// symlinks and path traversal so release builds cannot be redirected to an
+/// untrusted ffmpeg installation.
+fn adjacent_bundled_binary(executable: &Path, binary_name: &str) -> Option<PathBuf> {
+    let executable = executable.canonicalize().ok()?;
+    let executable_dir = executable.parent()?.canonicalize().ok()?;
+    let candidate = executable_dir.join(binary_name);
 
-    if let Err(error) = handle_ffmpeg_installation() {
-        error!("failed to install ffmpeg: {}", error);
+    let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return None;
     }
 
-    if let Ok(path) = which(EXECUTABLE_NAME) {
-        debug!("found ffmpeg after installation: {:?}", path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+
+    let candidate = candidate.canonicalize().ok()?;
+    if candidate.parent()?.canonicalize().ok()? != executable_dir {
+        return None;
+    }
+    Some(candidate)
+}
+
+#[cfg(debug_assertions)]
+fn debug_executable(path: &Path) -> Option<PathBuf> {
+    // Developer PATH entries are commonly symlinks (for example Homebrew).
+    // Following them is acceptable here because this code is absent in release.
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    path.canonicalize().ok()
+}
+
+fn find_ffmpeg_path_internal() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    if let Some(path) = current_exe
+        .as_deref()
+        .and_then(|exe| adjacent_bundled_binary(exe, EXECUTABLE_NAME))
+    {
+        debug!("Using bundled ffmpeg sidecar");
         return Some(path);
     }
 
-    let installation_dir = sidecar_dir().map_err(|e| e.to_string()).unwrap();
-    let ffmpeg_in_installation = installation_dir.join(EXECUTABLE_NAME);
-    if ffmpeg_in_installation.is_file() {
-        debug!("found ffmpeg in directory: {:?}", ffmpeg_in_installation);
-        return Some(ffmpeg_in_installation);
-    }
-
-    // Windows often has nested structure like ffmpeg-6.0-full_build/bin/ffmpeg.exe
-    #[cfg(windows)]
+    // Release builds fail closed. They never consult PATH, HOME, the current
+    // directory, environment overrides, or the network for executable code.
+    #[cfg(not(debug_assertions))]
     {
-        debug!("Searching for nested ffmpeg in {:?}", installation_dir);
-        if let Ok(entries) = std::fs::read_dir(&installation_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Check bin/ffmpeg.exe
-                    let bin_ffmpeg = path.join("bin").join(EXECUTABLE_NAME);
-                    if bin_ffmpeg.exists() {
-                        debug!("found ffmpeg in nested bin: {:?}", bin_ffmpeg);
-                        return Some(bin_ffmpeg);
-                    }
-                    // Check root of subdir
-                    let root_ffmpeg = path.join(EXECUTABLE_NAME);
-                    if root_ffmpeg.exists() {
-                        debug!("found ffmpeg in nested root: {:?}", root_ffmpeg);
-                        return Some(root_ffmpeg);
-                    }
-                }
+        error!("Bundled ffmpeg sidecar is missing or failed validation");
+        None
+    }
+
+    // Developer builds retain convenient local fallbacks, but still require a
+    // regular executable file. These paths are not compiled into releases.
+    #[cfg(debug_assertions)]
+    {
+        if let Some(path) = std::env::var_os("MEETILY_FFMPEG")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| debug_executable(Path::new(&value)))
+        {
+            debug!("Using developer ffmpeg override");
+            return Some(path);
+        }
+
+        if let Ok(path) = which(EXECUTABLE_NAME) {
+            if let Some(path) = debug_executable(&path) {
+                debug!("Using ffmpeg from developer PATH");
+                return Some(path);
             }
         }
-    }
 
-    error!("ffmpeg not found even after installation");
-    None // Return None if ffmpeg is not found
-}
-
-fn handle_ffmpeg_installation() -> Result<(), anyhow::Error> {
-    if ffmpeg_is_installed() {
-        debug!("ffmpeg is already installed");
-        return Ok(());
-    }
-
-    debug!("ffmpeg not found. installing...");
-    match check_latest_version() {
-        Ok(version) => debug!("latest version: {}", version),
-        Err(e) => debug!("skipping version check due to error: {e}"),
-    }
-
-    let download_url = ffmpeg_download_url()?;
-    let destination = get_ffmpeg_install_dir()?;
-
-    debug!("downloading from: {:?}", download_url);
-    let archive_path = download_ffmpeg_package(download_url, &destination)?;
-    debug!("downloaded package: {:?}", archive_path);
-
-    debug!("extracting...");
-    unpack_ffmpeg(&archive_path, &destination)?;
-
-    let version = ffmpeg_version()?;
-
-    debug!("done! installed ffmpeg version {}", version);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn get_ffmpeg_install_dir() -> Result<PathBuf, anyhow::Error> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("couldn't find home directory"))?;
-
-    let local_bin = home.join(".local").join("bin");
-
-    // Create directory if it doesn't exist
-    if !local_bin.exists() {
-        debug!("creating .local/bin directory");
-        std::fs::create_dir_all(&local_bin)?;
-
-        // Check both .bashrc and .zshrc
-        let shell_configs = vec![
-            home.join(".bashrc"),
-            home.join(".bash_profile"), // macOS often uses .bash_profile instead of .bashrc
-            home.join(".zshrc"),
-        ];
-
-        for config in shell_configs {
-            if config.exists() {
-                let content = std::fs::read_to_string(&config)?;
-                if !content.contains(".local/bin") {
-                    debug!("adding .local/bin to PATH in {:?}", config);
-                    std::fs::write(
-                        config,
-                        format!("{}\nexport PATH=\"$HOME/.local/bin:$PATH\"\n", content),
-                    )?;
-                }
-            }
+        #[cfg(target_os = "macos")]
+        if let Some(path) = dirs::home_dir()
+            .map(|home| home.join(".local/bin").join(EXECUTABLE_NAME))
+            .and_then(|path| debug_executable(&path))
+        {
+            debug!("Using developer ffmpeg from .local/bin");
+            return Some(path);
         }
-    }
 
-    Ok(local_bin)
+        if let Some(path) = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(EXECUTABLE_NAME))
+            .and_then(|path| debug_executable(&path))
+        {
+            debug!("Using developer ffmpeg from current directory");
+            return Some(path);
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(path) = current_exe
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("../Resources").join(EXECUTABLE_NAME))
+            .and_then(|path| debug_executable(&path))
+        {
+            debug!("Using developer ffmpeg from Resources");
+            return Some(path);
+        }
+
+        error!("ffmpeg executable not found; release bundles must include the verified sidecar");
+        None
+    }
 }
 
-// For other platforms, keep your existing installation directory logic
-#[cfg(not(target_os = "macos"))]
-fn get_ffmpeg_install_dir() -> Result<PathBuf, anyhow::Error> {
-    // Your existing logic for other platforms
-    sidecar_dir().map_err(|e| anyhow::anyhow!(e))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn exact_hash_verifier_rejects_changed_ffmpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("ffmpeg");
+        std::fs::write(&binary, b"reviewed").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"reviewed"));
+        assert!(file_matches(&binary, 8, &expected));
+
+        std::fs::write(&binary, b"tampered").unwrap();
+        assert!(!file_matches(&binary, 8, &expected));
+    }
+
+    #[test]
+    fn accepts_only_adjacent_regular_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let external_directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("meetily");
+        let ffmpeg = directory.path().join(EXECUTABLE_NAME);
+        let external_ffmpeg = external_directory.path().join(EXECUTABLE_NAME);
+        File::create(&executable).unwrap();
+        File::create(&ffmpeg).unwrap();
+        File::create(&external_ffmpeg).unwrap();
+        #[cfg(unix)]
+        {
+            make_executable(&executable);
+            make_executable(&ffmpeg);
+            make_executable(&external_ffmpeg);
+        }
+
+        assert_eq!(
+            adjacent_bundled_binary(&executable, EXECUTABLE_NAME),
+            Some(ffmpeg.canonicalize().unwrap())
+        );
+        assert!(adjacent_bundled_binary(&executable, external_ffmpeg.to_str().unwrap()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_and_non_executable_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("meetily");
+        let target = directory.path().join("real-ffmpeg");
+        let sidecar = directory.path().join(EXECUTABLE_NAME);
+        File::create(&executable).unwrap();
+        File::create(&target).unwrap();
+        make_executable(&executable);
+
+        assert!(adjacent_bundled_binary(&executable, EXECUTABLE_NAME).is_none());
+        make_executable(&target);
+        symlink(&target, &sidecar).unwrap();
+        assert!(adjacent_bundled_binary(&executable, EXECUTABLE_NAME).is_none());
+    }
 }

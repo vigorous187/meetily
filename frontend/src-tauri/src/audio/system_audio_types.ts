@@ -36,7 +36,6 @@ await invoke('start_system_audio_monitoring');
 
 // Listen for system audio events
 const unlisten = await listen<string[]>('system-audio-started', (event) => {
-  console.log('Apps using system audio:', event.payload);
 });
 
 // Check permissions

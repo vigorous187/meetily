@@ -52,6 +52,7 @@ const Sidebar: React.FC = () => {
     searchTranscripts,
     searchResults,
     isSearching,
+    searchError,
     meetings,
     setMeetings,
     serverAddress
@@ -118,7 +119,7 @@ const Sidebar: React.FC = () => {
         const data = await invoke('api_get_model_config') as any;
         if (data && data.provider !== null) {
           // Fetch API key if not included and provider requires it
-          if (data.provider !== 'ollama' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && !data.apiKey) {
             try {
               const apiKeyData = await invoke('api_get_api_key', {
                 provider: data.provider
@@ -165,7 +166,6 @@ const Sidebar: React.FC = () => {
     const setupListener = async () => {
       const { listen } = await import('@tauri-apps/api/event');
       const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
-        console.log('Sidebar received model-config-updated event:', event.payload);
         setModelConfig(event.payload);
       });
 
@@ -217,7 +217,7 @@ const Sidebar: React.FC = () => {
         model: configToSave.model,
         apiKey: configToSave.apiKey ?? null
       };
-      console.log('Saving transcript config with payload:', payload);
+      console.log('Saving transcript configuration');
 
       await invoke('api_save_transcript_config', {
         provider: payload.provider,
@@ -238,22 +238,24 @@ const Sidebar: React.FC = () => {
   };
 
   // Handle search input changes
-  const handleSearchChange = useCallback(async (value: string) => {
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      void searchTranscripts(searchQuery);
+    }, searchQuery.trim() ? 350 : 0);
+
+    return () => window.clearTimeout(timeout);
+  }, [searchQuery, searchTranscripts]);
+
+  const handleSearchChange = useCallback((value: string) => {
     setSearchQuery(value);
 
-    // If search query is empty, just return to normal view
-    if (!value.trim()) return;
-
-    // Search through transcripts
-    await searchTranscripts(value);
-
     // Make sure the meetings folder is expanded when searching
-    if (!expandedFolders.has('meetings')) {
+    if (value.trim() && !expandedFolders.has('meetings')) {
       const newExpanded = new Set(expandedFolders);
       newExpanded.add('meetings');
       setExpandedFolders(newExpanded);
     }
-  }, [expandedFolders, searchTranscripts]);
+  }, [expandedFolders]);
 
   // Combine search results with sidebar items
   const filteredSidebarItems = useMemo(() => {
@@ -263,6 +265,10 @@ const Sidebar: React.FC = () => {
     if (searchResults.length > 0) {
       // Get the IDs of meetings that matched in transcripts
       const matchedMeetingIds = new Set(searchResults.map(result => result.id));
+      const resultRank = new Map<string, number>();
+      searchResults.forEach((result, index) => {
+        if (!resultRank.has(result.id)) resultRank.set(result.id, index);
+      });
 
       return sidebarItems
         .map(folder => {
@@ -271,13 +277,19 @@ const Sidebar: React.FC = () => {
             if (!folder.children) return folder;
 
             // Filter children based on search results or title match
-            const filteredChildren = folder.children.filter(item => {
-              // Include if the meeting ID is in our search results
-              if (matchedMeetingIds.has(item.id)) return true;
+            const filteredChildren = folder.children
+              .filter(item => {
+                // Include if the meeting ID is in our search results
+                if (matchedMeetingIds.has(item.id)) return true;
 
-              // Or if the title matches the search query
-              return item.title.toLowerCase().includes(searchQuery.toLowerCase());
-            });
+                // Or if the title matches the search query
+                return item.title.toLowerCase().includes(searchQuery.toLowerCase());
+              })
+              // Preserve semantic relevance order; title-only matches follow.
+              .sort((left, right) =>
+                (resultRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+                (resultRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)
+              );
 
             return {
               ...folder,
@@ -551,6 +563,14 @@ const Sidebar: React.FC = () => {
     return searchResults.find(result => result.id === itemId);
   };
 
+  const formatSearchTimestamp = (timestamp: string) => {
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds) || seconds < 0) return null;
+    const wholeSeconds = Math.floor(seconds);
+    const minutes = Math.floor(wholeSeconds / 60);
+    return `${minutes}:${String(wholeSeconds % 60).padStart(2, '0')}`;
+  };
+
   const renderItem = (item: SidebarItem, depth = 0) => {
     const isExpanded = expandedFolders.has(item.id);
     const paddingLeft = `${depth * 12 + 12}px`;
@@ -645,7 +665,11 @@ const Sidebar: React.FC = () => {
               {/* Show transcript match snippet if available */}
               {hasTranscriptMatch && (
                 <div className="mt-1 ml-8 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
-                  <span className="font-medium text-yellow-600">Match:</span> {matchingResult.matchContext}
+                  <span className="font-medium text-yellow-600">Match</span>
+                  {formatSearchTimestamp(matchingResult.timestamp) && (
+                    <span className="text-gray-400"> at {formatSearchTimestamp(matchingResult.timestamp)}</span>
+                  )}
+                  <span> — {matchingResult.matchContext}</span>
                 </div>
               )}
             </div>
@@ -696,7 +720,12 @@ const Sidebar: React.FC = () => {
 
                 <div className="relative mb-1">
                   <InputGroup >
-                    <InputGroupInput placeholder='Search meeting content...' value={searchQuery}
+                    <InputGroupInput
+                      aria-label='Search meeting content'
+                      aria-busy={isSearching}
+                      maxLength={512}
+                      placeholder='Search meeting content...'
+                      value={searchQuery}
                       onChange={(e) => handleSearchChange(e.target.value)}
                     />
                     <InputGroupAddon>
@@ -712,6 +741,15 @@ const Sidebar: React.FC = () => {
                       </InputGroupAddon>
                     }
                   </InputGroup>
+                  {searchQuery.trim() && !isSearching && (
+                    <p className="px-1 pt-1 text-xs text-gray-500" role="status">
+                      {searchError
+                        ? searchError
+                        : searchResults.length > 0
+                        ? `${new Set(searchResults.map(result => result.id)).size} matching meeting${new Set(searchResults.map(result => result.id)).size === 1 ? '' : 's'}`
+                        : 'No transcript matches'}
+                    </p>
+                  )}
                 </div>
               </div>
             )}
@@ -811,7 +849,7 @@ const Sidebar: React.FC = () => {
             </button>
             <Info isCollapsed={isCollapsed} />
             <div className="w-full flex items-center justify-center px-3 py-1 text-xs text-gray-400">
-              v0.4.0
+              v0.4.3
             </div>
           </div>
         )}

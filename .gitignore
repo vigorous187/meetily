@@ -75,5 +75,26 @@ node_modules/
 experiments/
 .cursor/
 target/
+release/
 
-frontend/src-tauri/binaries/
+# Release sidecars are reviewed build inputs, not disposable local caches.
+# Keep the directory closed by default and explicitly version the audited
+# Apple Silicon artifacts and their provenance/license records.
+frontend/src-tauri/binaries/*
+!frontend/src-tauri/binaries/ffmpeg-aarch64-apple-darwin
+!frontend/src-tauri/binaries/diarization-helper-aarch64-apple-darwin
+!frontend/src-tauri/binaries/llama-helper-aarch64-apple-darwin
+!frontend/src-tauri/binaries/FFMPEG-PROVENANCE.md
+!frontend/src-tauri/binaries/SIDECAR-PROVENANCE.md
+!frontend/src-tauri/binaries/COPYING.LGPLv2.1
+
+# Reviewed static ONNX Runtime release input. Other vendor outputs remain
+# untracked unless explicitly reviewed and allowlisted.
+frontend/src-tauri/vendor/onnxruntime/*
+!frontend/src-tauri/vendor/onnxruntime/aarch64-apple-darwin/
+frontend/src-tauri/vendor/onnxruntime/aarch64-apple-darwin/*
+!frontend/src-tauri/vendor/onnxruntime/aarch64-apple-darwin/lib/
+frontend/src-tauri/vendor/onnxruntime/aarch64-apple-darwin/lib/*
+!frontend/src-tauri/vendor/onnxruntime/aarch64-apple-darwin/lib/libonnxruntime.a
+!frontend/src-tauri/vendor/onnxruntime/PROVENANCE.md
+!frontend/src-tauri/vendor/onnxruntime/LICENSE

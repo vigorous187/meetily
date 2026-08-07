@@ -1,0 +1,55 @@
+#!/bin/bash
+set -euo pipefail
+
+# cidre builds many static-library targets without a scheme. Xcode only accepts
+# -derivedDataPath with a scheme, so sandboxed verification uses a temporary copy
+# of cidre's project plus an aggregate scheme. Release builds outside the Codex
+# workspace sandbox use Xcode directly and never need this wrapper.
+real_xcodebuild=/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+scheme_source="$script_dir/../cidre-macos.xcscheme"
+temp_root=/tmp/meetily-cidre-xcode-project-v2
+temp_project="$temp_root/pomace/pomace.xcodeproj"
+derived_data=/tmp/meetily-xcode-cache/derived
+
+original_project=
+declare -a forwarded=()
+while (($#)); do
+  case "$1" in
+    -project)
+      shift
+      original_project="${1:?missing Xcode project after -project}"
+      ;;
+    -target)
+      shift
+      : "${1:?missing target after -target}"
+      ;;
+    *)
+      forwarded+=("$1")
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$original_project" ]]; then
+  exec "$real_xcodebuild" "${forwarded[@]}"
+fi
+
+if [[ "$original_project" != /* ]]; then
+  original_project="$PWD/${original_project#./}"
+fi
+original_project_dir="$(dirname -- "$original_project")"
+original_pomace_dir="$original_project_dir"
+
+if [[ ! -f "$temp_project/project.pbxproj" ]]; then
+  mkdir -p "$temp_root"
+  cp -R "$original_pomace_dir" "$temp_root/pomace"
+fi
+mkdir -p "$temp_project/xcshareddata/xcschemes" "$derived_data"
+cp "$scheme_source" "$temp_project/xcshareddata/xcschemes/meetily-cidre.xcscheme"
+
+exec "$real_xcodebuild" \
+  -project "$temp_project" \
+  -scheme meetily-cidre \
+  -derivedDataPath "$derived_data" \
+  "${forwarded[@]}"

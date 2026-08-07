@@ -27,6 +27,7 @@ pub struct RecordingManager {
     stream_manager: AudioStreamManager,
     pipeline_manager: AudioPipelineManager,
     recording_saver: RecordingSaver,
+    diarization_capture: Option<crate::diarization::runtime::SystemAudioCapture>,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
 }
@@ -47,6 +48,7 @@ impl RecordingManager {
             stream_manager,
             pipeline_manager,
             recording_saver: RecordingSaver::new(),
+            diarization_capture: None,
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
         }
@@ -75,6 +77,24 @@ impl RecordingManager {
         // Pipeline will mix mic + system audio professionally and send to this channel
         // Pass auto_save to control whether audio checkpoints are created
         let recording_sender = self.recording_saver.start_accumulation(auto_save);
+
+        // Diarization is best-effort and fully local. Failure to create its private
+        // temporary file must never prevent a meeting from being recorded.
+        self.diarization_capture = if system_device.is_some() {
+            match crate::diarization::runtime::SystemAudioCapture::new() {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    warn!("Local diarization is unavailable for this meeting: {}", error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let diarization_audio_sink = self
+            .diarization_capture
+            .as_ref()
+            .map(crate::diarization::runtime::SystemAudioCapture::sink);
 
         // Start recording state first
         self.state.start_recording()?;
@@ -112,6 +132,7 @@ impl RecordingManager {
             0, // Ignored - using dynamic sizing internally
             48000, // 48kHz sample rate
             Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
+            diarization_audio_sink,
             mic_name,
             mic_kind,
             sys_name,
@@ -288,6 +309,21 @@ impl RecordingManager {
     pub async fn save_recording_only<R: tauri::Runtime>(&mut self, app: &tauri::AppHandle<R>) -> Result<()> {
         debug!("Saving recording with transcript chunks");
 
+        // Run the packaged helper only after capture has stopped. The capture owns a
+        // TempPath, so cancellation, timeout, helper errors, and success all delete it.
+        if let Some(capture) = self.diarization_capture.take() {
+            match capture.finish(app).await {
+                Ok(ranges) if !ranges.is_empty() => {
+                    if let Some(folder) = self.recording_saver.get_meeting_folder() {
+                        crate::diarization::runtime::store_pending(folder, ranges);
+                        info!("✅ Local speaker turns are ready for transcript persistence");
+                    }
+                }
+                Ok(_) => info!("Local diarization produced no remote speaker turns; using fallback labels"),
+                Err(error) => warn!("Local diarization failed closed to fallback labels: {}", error),
+            }
+        }
+
         // Get actual recording duration from state
         let recording_duration = self.state.get_active_recording_duration();
         info!("Recording duration from state: {:?}s", recording_duration);
@@ -458,6 +494,8 @@ impl RecordingManager {
 
     /// Cleanup all resources without saving
     pub async fn cleanup_without_save(&mut self) {
+        // Dropping this owner removes any temporary system-audio file.
+        self.diarization_capture.take();
         if self.is_recording() {
             debug!("Stopping recording without saving during cleanup");
 

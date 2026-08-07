@@ -70,7 +70,6 @@ export const useAudioPlayer = (audioPath: string | null) => {
         return;
       }
 
-      console.log('Loading audio from:', audioPath);
       
       // Read the file using Tauri command
       const result = await invoke<number[]>('read_audio_file', { 
@@ -128,7 +127,6 @@ export const useAudioPlayer = (audioPath: string | null) => {
 
   // Load audio when path changes
   useEffect(() => {
-    console.log('Audio path changed:', audioPath);
     if (audioPath) {
       loadAudio();
     }

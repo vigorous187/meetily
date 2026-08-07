@@ -1,10 +1,65 @@
 use log::{error, info};
 use serde::Serialize;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, SqliteConnection};
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::manager::DatabaseManager;
 use crate::state::AppState;
+
+static APPROVED_LEGACY_DATABASES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+const MAX_LEGACY_DATABASE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+async fn validate_legacy_database(path: &std::path::Path) -> Result<(PathBuf, u64), String> {
+    if path.extension().and_then(|value| value.to_str()) != Some("db") {
+        return Err("Legacy database must have a .db extension".to_string());
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("Could not inspect legacy database: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Legacy database must be a regular non-symlink file".to_string());
+    }
+    if metadata.len() < 100 || metadata.len() > MAX_LEGACY_DATABASE_BYTES {
+        return Err("Legacy database size is outside the supported range".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("Could not verify legacy database: {error}"))?;
+    let mut header = [0_u8; 16];
+    std::fs::File::open(&canonical)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|error| format!("Could not read legacy database header: {error}"))?;
+    if &header != b"SQLite format 3\0" {
+        return Err("Selected file is not a SQLite database".to_string());
+    }
+
+    let options = SqliteConnectOptions::new()
+        .filename(&canonical)
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| format!("Could not open legacy database safely: {error}"))?;
+    let expected_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('meetings', 'transcripts')",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .map_err(|error| format!("Could not inspect legacy database schema: {error}"))?;
+    if expected_tables != 2 {
+        return Err("Selected database does not contain the required Meetily schema".to_string());
+    }
+    Ok((canonical, metadata.len()))
+}
+
+fn approve_legacy_database(path: PathBuf) {
+    APPROVED_LEGACY_DATABASES.lock().unwrap().insert(path);
+}
 
 #[derive(Serialize)]
 pub struct DatabaseCheckResult {
@@ -34,9 +89,12 @@ pub async fn select_legacy_database_path(app: AppHandle) -> Result<Option<String
         .blocking_pick_file();
 
     if let Some(path) = file_path {
-        let path_str = path.to_string();
-        info!("User selected path: {}", path_str);
-        Ok(Some(path_str))
+        let selected_path = path
+            .as_path()
+            .ok_or_else(|| "Selected database must be a local file".to_string())?;
+        let (canonical, _) = validate_legacy_database(selected_path).await?;
+        approve_legacy_database(canonical.clone());
+        Ok(Some(canonical.to_string_lossy().into_owned()))
     } else {
         info!("User cancelled file selection");
         Ok(None)
@@ -46,40 +104,15 @@ pub async fn select_legacy_database_path(app: AppHandle) -> Result<Option<String
 /// Detect legacy database from a selected path (root repo, backend folder, or db file)
 #[tauri::command]
 pub async fn detect_legacy_database(selected_path: String) -> Result<Option<String>, String> {
-    let path = PathBuf::from(&selected_path);
-
-    info!("Detecting legacy database from path: {}", selected_path);
-
-    // Case 1: User selected the .db file directly
-    if path.is_file() {
-        if let Some(extension) = path.extension() {
-            if extension == "db" {
-                info!("Direct .db file selected: {}", selected_path);
-                return Ok(Some(selected_path));
-            }
-        }
+    let (canonical, _) = validate_legacy_database(std::path::Path::new(&selected_path)).await?;
+    if !APPROVED_LEGACY_DATABASES
+        .lock()
+        .unwrap()
+        .contains(&canonical)
+    {
+        return Err("Select the legacy database through Meetily's file picker first".to_string());
     }
-
-    // Case 2: User selected directory containing meeting_minutes.db
-    if path.is_dir() {
-        let direct_db = path.join("meeting_minutes.db");
-        if direct_db.exists() && direct_db.is_file() {
-            let db_path = direct_db.to_string_lossy().to_string();
-            info!("Found database in selected directory: {}", db_path);
-            return Ok(Some(db_path));
-        }
-
-        // Case 3: User selected root repo (check backend subdirectory)
-        let backend_db = path.join("backend").join("meeting_minutes.db");
-        if backend_db.exists() && backend_db.is_file() {
-            let db_path = backend_db.to_string_lossy().to_string();
-            info!("Found database in backend subdirectory: {}", db_path);
-            return Ok(Some(db_path));
-        }
-    }
-
-    info!("No legacy database found at path: {}", selected_path);
-    Ok(None)
+    Ok(Some(canonical.to_string_lossy().into_owned()))
 }
 
 /// Check for legacy database in the default app data directory
@@ -91,54 +124,32 @@ pub async fn check_default_legacy_database(app: AppHandle) -> Result<Option<Stri
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
 
     let legacy_db = app_data_dir.join("meeting_minutes.db");
-    info!("Checking for default legacy database at: {:?}", legacy_db);
-
-    if legacy_db.exists() && legacy_db.is_file() {
-        let path_str = legacy_db.to_string_lossy().to_string();
-        info!("Found default legacy database: {}", path_str);
-        Ok(Some(path_str))
-    } else {
-        info!("No default legacy database found");
-        Ok(None)
+    if !legacy_db.exists() {
+        return Ok(None);
     }
+    let (canonical, _) = validate_legacy_database(&legacy_db).await?;
+    approve_legacy_database(canonical.clone());
+    Ok(Some(canonical.to_string_lossy().into_owned()))
 }
 
 /// Check if the Homebrew database exists and return its size
 /// This is specifically for detecting old Python backend installations
 #[tauri::command]
 pub async fn check_homebrew_database(path: String) -> Result<Option<DatabaseCheckResult>, String> {
-    let db_path = PathBuf::from(&path);
-    
-    info!("Checking for Homebrew database at: {}", path);
-    
-    // Check if file exists and is a regular file
-    if db_path.exists() && db_path.is_file() {
-        // Get file metadata to check size
-        match std::fs::metadata(&db_path) {
-            Ok(metadata) => {
-                let size = metadata.len();
-                info!("Found Homebrew database: {} ({} bytes)", path, size);
-                
-                // Only consider it valid if it has content (not empty)
-                if size > 0 {
-                    Ok(Some(DatabaseCheckResult {
-                        exists: true,
-                        size,
-                    }))
-                } else {
-                    info!("Database file exists but is empty");
-                    Ok(None)
-                }
-            }
-            Err(e) => {
-                error!("Failed to read database metadata: {}", e);
-                Ok(None)
-            }
-        }
-    } else {
-        info!("No database found at Homebrew location");
-        Ok(None)
+    const HOMEBREW_DATABASES: &[&str] = &[
+        "/opt/homebrew/var/meetily/meeting_minutes.db",
+        "/usr/local/var/meetily/meeting_minutes.db",
+    ];
+    if !HOMEBREW_DATABASES.contains(&path.as_str()) {
+        return Err("Unsupported Homebrew database location".to_string());
     }
+    let db_path = PathBuf::from(path);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let (canonical, size) = validate_legacy_database(&db_path).await?;
+    approve_legacy_database(canonical);
+    Ok(Some(DatabaseCheckResult { exists: true, size }))
 }
 
 /// Import legacy database and initialize the database manager
@@ -147,13 +158,13 @@ pub async fn import_and_initialize_database(
     app: AppHandle,
     legacy_db_path: String,
 ) -> Result<(), String> {
-    info!(
-        "Starting import of legacy database from: {}",
-        legacy_db_path
-    );
+    let (canonical, _) = validate_legacy_database(std::path::Path::new(&legacy_db_path)).await?;
+    if !APPROVED_LEGACY_DATABASES.lock().unwrap().remove(&canonical) {
+        return Err("Legacy database import was not approved by Meetily's import flow".to_string());
+    }
 
     // Import and get initialized manager
-    let db_manager = DatabaseManager::import_legacy_database(&app, &legacy_db_path)
+    let db_manager = DatabaseManager::import_legacy_database(&app, &canonical.to_string_lossy())
         .await
         .map_err(|e| {
             error!("Failed to import legacy database: {}", e);
@@ -185,12 +196,16 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
         })?;
 
     // Update app state with the new manager
-    app.manage(AppState { db_manager: db_manager.clone() });
+    app.manage(AppState {
+        db_manager: db_manager.clone(),
+    });
 
     // Set default model configuration for fresh installs
     let pool = db_manager.pool();
-    
-    let default_summary_model = crate::summary::summary_engine::commands::get_recommended_summary_model_for_current_system()
+
+    let default_summary_model =
+        crate::summary::summary_engine::commands::get_recommended_summary_model_for_current_system(
+        )
         .unwrap_or("qwen3.5:2b");
 
     // Default Summary Model: Built-in AI (Qwen recommendation for this system)
@@ -200,16 +215,21 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
         default_summary_model,
         "large-v3", // Default whisper model (unused for builtin but required)
         None,
-    ).await {
+    )
+    .await
+    {
         error!("Failed to set default summary model config: {}", e);
     }
 
     // Default Transcription Model: Parakeet
-    if let Err(e) = crate::database::repositories::setting::SettingsRepository::save_transcript_config(
-        pool,
-        "parakeet",
-        crate::config::DEFAULT_PARAKEET_MODEL,
-    ).await {
+    if let Err(e) =
+        crate::database::repositories::setting::SettingsRepository::save_transcript_config(
+            pool,
+            "parakeet",
+            crate::config::DEFAULT_PARAKEET_MODEL,
+        )
+        .await
+    {
         error!("Failed to set default transcription model config: {}", e);
     }
 

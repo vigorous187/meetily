@@ -1,6 +1,6 @@
 {
     "name": "meetily",
-    "version": "0.4.0",
+    "version": "0.4.3",
     "private": true,
     "main": "electron/main.js",
     "scripts": {
@@ -25,7 +25,7 @@
         "tauri:build:coreml": "tauri build -- --features coreml",
         "tauri:build:openblas": "tauri build -- --features openblas",
         "tauri:build:hipblas": "tauri build -- --features hipblas",
-        "lint": "next lint"
+        "lint": "eslint . --max-warnings 500"
     },
     "dependencies": {
         "@blocknote/core": "0.36.0",
@@ -56,13 +56,11 @@
         "@remirror/pm": "^3.0.0",
         "@remirror/react": "^3.0.1",
         "@tanstack/react-virtual": "^3.13.13",
-        "@tauri-apps/api": "^2.6.0",
-        "@tauri-apps/plugin-fs": "^2.4.0",
+        "@tauri-apps/api": "2.11.1",
         "@tauri-apps/plugin-notification": "~2.3.1",
+        "@tauri-apps/plugin-global-shortcut": "2.3.1",
         "@tauri-apps/plugin-os": "^2.3.2",
-        "@tauri-apps/plugin-process": "^2.3.0",
-        "@tauri-apps/plugin-store": "^2.4.0",
-        "@tauri-apps/plugin-updater": "^2.3.0",
+        "@tauri-apps/plugin-store": "2.4.4",
         "@tiptap/pm": "^2.10.4",
         "@tiptap/react": "^2.10.4",
         "@tiptap/starter-kit": "^2.10.4",
@@ -74,10 +72,10 @@
         "framer-motion": "^11.15.0",
         "lodash": "^4.17.21",
         "lucide-react": "^0.469.0",
-        "next": "^14.2.25",
+        "next": "15.5.21",
         "radix-ui": "^1.4.3",
-        "react": "^18.2.0",
-        "react-dom": "^18.2.0",
+        "react": "18.3.1",
+        "react-dom": "18.3.1",
         "react-hook-form": "^7.59.0",
         "react-markdown": "^9.0.1",
         "remark-gfm": "^4.0.1",
@@ -86,27 +84,25 @@
         "tailwindcss-animate": "^1.0.7",
         "zod": "^3.25.71"
     },
-    "pnpm": {
-        "overrides": {
-            "prosemirror-model": "1.25.3",
-            "prosemirror-state": "1.4.3",
-            "prosemirror-view": "1.41.3",
-            "prosemirror-transform": "1.10.4",
-            "prosemirror-tables": "1.8.1"
-        }
-    },
     "devDependencies": {
+        "@eslint/eslintrc": "3.3.6",
+        "@next/eslint-plugin-next": "15.5.21",
         "@tailwindcss/typography": "^0.5.15",
-        "@tauri-apps/cli": "^2.1.0",
-        "@tauri-apps/plugin-fs": "~2.4.0",
+        "@tauri-apps/cli": "2.11.4",
         "@types/node": "^20",
-        "@types/react": "^18.3.18",
-        "@types/react-dom": "^18.3.5",
+        "@types/react": "18.3.28",
+        "@types/react-dom": "18.3.7",
+        "@typescript-eslint/eslint-plugin": "8.65.0",
+        "@typescript-eslint/parser": "8.65.0",
         "autoprefixer": "^10.0.1",
-        "concurrently": "^8.2.2",
-        "postcss": "^8",
+        "eslint": "9.39.5",
+        "eslint-config-next": "15.5.21",
+        "eslint-plugin-import": "2.32.0",
+        "eslint-plugin-jsx-a11y": "6.10.2",
+        "eslint-plugin-react": "7.37.5",
+        "eslint-plugin-react-hooks": "5.2.0",
+        "postcss": "8.5.23",
         "tailwindcss": "^3.4.1",
-        "typescript": "^5.7.2",
-        "wait-on": "^7.2.0"
+        "typescript": "^5.7.2"
     }
 }

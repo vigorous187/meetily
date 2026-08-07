@@ -1,6 +1,6 @@
 "use client"
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
-import { useState, useEffect, useCallback, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import { Transcript, Summary } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -9,6 +9,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { isSummaryProcessingStatus, normalizeMeetingSummary } from "@/lib/meeting-summary";
+import { RequestGeneration } from "@/lib/request-generation";
+
+type SummaryUiStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
 interface MeetingDetailsResponse {
   id: string;
@@ -23,7 +27,7 @@ function MeetingDetailsContent() {
   const searchParams = useSearchParams();
   const meetingId = searchParams.get('id');
   const source = searchParams.get('source'); // Check if navigated from recording
-  const { setCurrentMeeting, refetchMeetings, stopSummaryPolling } = useSidebar();
+  const { setCurrentMeeting, refetchMeetings, startSummaryPolling, stopSummaryPolling } = useSidebar();
   const { isAutoSummary } = useConfig(); // Get auto-summary toggle state
   const router = useRouter();
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
@@ -32,6 +36,10 @@ function MeetingDetailsContent() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
   const [hasCheckedAutoGen, setHasCheckedAutoGen] = useState<boolean>(false);
+  const [hydratedSummaryStatus, setHydratedSummaryStatus] = useState<SummaryUiStatus>('idle');
+  const [hydratedSummaryError, setHydratedSummaryError] = useState<string | null>(null);
+  const summaryRequestGenerationRef = useRef(new RequestGeneration());
+  const autoGenerationRequestRef = useRef(new RequestGeneration());
 
   // Use pagination hook for efficient transcript loading
   const {
@@ -64,6 +72,8 @@ function MeetingDetailsContent() {
   // Set up auto-generation - respects DB as source of truth
   const setupAutoGeneration = useCallback(async () => {
     if (hasCheckedAutoGen) return; // Only check once
+    const generation = autoGenerationRequestRef.current.begin();
+    const isCurrent = () => autoGenerationRequestRef.current.isCurrent(generation);
 
     // Only auto-generate if navigated from recording
     if (source !== 'recording') {
@@ -82,6 +92,7 @@ function MeetingDetailsContent() {
     try {
       // Check what's currently in database
       const currentConfig = await invoke('api_get_model_config') as any;
+      if (!isCurrent()) return;
 
       // If DB already has a model, use it (never override!)
       if (currentConfig && currentConfig.model) {
@@ -93,6 +104,7 @@ function MeetingDetailsContent() {
 
       // DB is empty - check if gemma3:1b exists as fallback
       const hasGemma = await checkForGemmaModel();
+      if (!isCurrent()) return;
 
       if (hasGemma) {
         console.log('💾 DB empty, using gemma3:1b as initial default');
@@ -104,15 +116,18 @@ function MeetingDetailsContent() {
           apiKey: null,
           ollamaEndpoint: null,
         });
+        if (!isCurrent()) return;
 
         setShouldAutoGenerate(true);
       } else {
         console.log('⚠️ No model configured and gemma3:1b not found');
       }
     } catch (error) {
+      if (!isCurrent()) return;
       console.error('❌ Failed to setup auto-generation:', error);
     }
 
+    if (!isCurrent()) return;
     setHasCheckedAutoGen(true);
   }, [hasCheckedAutoGen, checkForGemmaModel, source, isAutoSummary]);
 
@@ -124,7 +139,6 @@ function MeetingDetailsContent() {
     }
 
     if (metadata) {
-      console.log('Meeting metadata loaded:', metadata);
 
       // Build meeting details from metadata and paginated transcripts
       setMeetingDetails({
@@ -169,6 +183,10 @@ function MeetingDetailsContent() {
     // Reset auto-generation state to allow new meeting to be checked
     setHasCheckedAutoGen(false);
     setShouldAutoGenerate(false);
+    setHydratedSummaryStatus('idle');
+    setHydratedSummaryError(null);
+    summaryRequestGenerationRef.current.invalidate();
+    autoGenerationRequestRef.current.invalidate();
   }, [meetingId]);
 
   // Cleanup: Stop polling when navigating away from a meeting
@@ -185,6 +203,7 @@ function MeetingDetailsContent() {
     console.log('MeetingDetails useEffect triggered - meetingId:', meetingId);
 
     if (!meetingId || meetingId === 'intro-call') {
+      summaryRequestGenerationRef.current.invalidate();
       console.warn('No valid meeting ID in URL - meetingId:', meetingId);
       setError("No meeting selected");
       setIsLoading(false);
@@ -198,119 +217,105 @@ function MeetingDetailsContent() {
     setMeetingSummary(null);
     setError(null);
     setIsLoading(true);
+    setHydratedSummaryStatus('idle');
+    setHydratedSummaryError(null);
 
-    const fetchMeetingSummary = async () => {
-      try {
-        const summary = await invoke('api_get_summary', {
-          meetingId: meetingId,
-        }) as any;
+    const requestGeneration = summaryRequestGenerationRef.current;
+    const generation = requestGeneration.begin();
+    const isCurrentRequest = () => requestGeneration.isCurrent(generation);
 
-        console.log('FETCH SUMMARY: Raw response:', summary);
+    const applySummaryResponse = (summary: any) => {
+      if (!isCurrentRequest()) return;
 
-        // Check if the summary request failed with 404 or error status, or if no summary exists yet (idle)
-        // Note: 'cancelled' and 'failed' statuses can still have data if backup was restored
-        if (summary.status === 'idle' || (!summary.data && summary.status === 'error')) {
-          console.warn('Meeting summary not found or no summary generated yet:', summary.error || 'idle');
-          setMeetingSummary(null);
-          return;
-        }
+      const normalized = normalizeMeetingSummary(summary?.data);
+      const status = summary?.status;
 
-        const summaryData = summary.data || {};
-
-        // Parse if it's a JSON string (backend may return double-encoded JSON)
-        let parsedData = summaryData;
-        if (typeof summaryData === 'string') {
-          try {
-            parsedData = JSON.parse(summaryData);
-          } catch (e) {
-            parsedData = {};
-          }
-        }
-
-        console.log('🔍 FETCH SUMMARY: Parsed data:', parsedData);
-
-        // Priority 1: BlockNote JSON format
-        if (parsedData.summary_json) {
-          setMeetingSummary(parsedData as any);
-          return;
-        }
-
-        // Priority 2: Markdown format
-        if (parsedData.markdown) {
-          setMeetingSummary(parsedData as any);
-          return;
-        }
-
-        // Legacy format - apply formatting
-        console.log('LEGACY FORMAT: Detected legacy format, applying section formatting');
-
-        const { MeetingName, _section_order, ...restSummaryData } = parsedData;
-
-        // Format the summary data with consistent styling - PRESERVE ORDER
-        const formattedSummary: Summary = {};
-
-        // Use section order if available to maintain exact order and handle duplicates
-        const sectionKeys = _section_order || Object.keys(restSummaryData);
-
-        console.log('LEGACY FORMAT: Processing sections:', sectionKeys);
-
-        for (const key of sectionKeys) {
-          try {
-            const section = restSummaryData[key];
-            // Comprehensive null checks to prevent the error
-            if (section &&
-              typeof section === 'object' &&
-              'title' in section &&
-              'blocks' in section) {
-              const typedSection = section as { title?: string; blocks?: any[] };
-
-              // Ensure blocks is an array before mapping
-              if (Array.isArray(typedSection.blocks)) {
-                formattedSummary[key] = {
-                  title: typedSection.title || key,
-                  blocks: typedSection.blocks.map((block: any) => ({
-                    ...block,
-                    // type: 'bullet',
-                    color: 'default',
-                    content: block?.content?.trim() || ''
-                  }))
-                };
-              } else {
-                // Handle case where blocks is not an array
-                console.warn(`LEGACY FORMAT: Section ${key} has invalid blocks:`, typedSection.blocks);
-                formattedSummary[key] = {
-                  title: typedSection.title || key,
-                  blocks: []
-                };
-              }
-            } else {
-              console.warn(`LEGACY FORMAT: Skipping invalid section ${key}:`, section);
-            }
-          } catch (error) {
-            console.warn(`LEGACY FORMAT: Error processing section ${key}:`, error);
-            // Continue processing other sections
-          }
-        }
-
-        console.log('LEGACY FORMAT: Formatted summary:', formattedSummary);
-        setMeetingSummary(formattedSummary);
-      } catch (error) {
-        console.error('FETCH SUMMARY: Error fetching meeting summary:', error);
-        // Don't set error state for summary fetch failure, set to null to show generate button
+      if (normalized) {
+        setMeetingSummary(normalized as Summary);
+      } else if (!isSummaryProcessingStatus(status)) {
         setMeetingSummary(null);
       }
+
+      if (isSummaryProcessingStatus(status)) {
+        setHydratedSummaryStatus(
+          status === 'summarizing' || status === 'regenerating' ? status : 'processing'
+        );
+        setHydratedSummaryError(null);
+        return;
+      }
+
+      if (status === 'completed' && normalized) {
+        setHydratedSummaryStatus('completed');
+        setHydratedSummaryError(null);
+        return;
+      }
+
+      if ((status === 'cancelled' || status === 'failed' || status === 'error') && normalized) {
+        // The backend restores the previous summary after a cancelled/failed regeneration.
+        setHydratedSummaryStatus('idle');
+        setHydratedSummaryError(null);
+        return;
+      }
+
+      if (status === 'failed' || status === 'error') {
+        setHydratedSummaryStatus('error');
+        setHydratedSummaryError(summary?.error || 'Summary generation failed. Please try again.');
+        return;
+      }
+
+      if (status === 'completed' && !normalized) {
+        setHydratedSummaryStatus('error');
+        setHydratedSummaryError('Summary completed, but its result could not be loaded. Please try again.');
+        return;
+      }
+
+      setHydratedSummaryStatus('idle');
+      setHydratedSummaryError(null);
+    };
+
+    const resolveCompletedSummary = async (summary: any) => {
+      if (summary?.status !== 'completed' || normalizeMeetingSummary(summary?.data)) {
+        return summary;
+      }
+
+      const refreshedSummary = await invoke('api_get_summary', { meetingId }) as any;
+      return isCurrentRequest() ? refreshedSummary : summary;
     };
 
     const loadData = async () => {
       try {
-        await fetchMeetingSummary();
+        const summary = await invoke('api_get_summary', { meetingId }) as any;
+        if (!isCurrentRequest()) return;
+
+        const resolvedSummary = await resolveCompletedSummary(summary);
+        if (!isCurrentRequest()) return;
+        applySummaryResponse(resolvedSummary);
+
+        if (isSummaryProcessingStatus(summary?.status)) {
+          startSummaryPolling(meetingId, `resume:${meetingId}`, async (pollingResult, isCurrentPoll) => {
+            if (!isCurrentRequest() || !isCurrentPoll()) return;
+            const resolvedPollingResult = await resolveCompletedSummary(pollingResult);
+            if (!isCurrentRequest() || !isCurrentPoll()) return;
+            applySummaryResponse(resolvedPollingResult);
+          });
+        }
+      } catch (fetchError) {
+        if (!isCurrentRequest()) return;
+        console.error('FETCH SUMMARY: Error fetching meeting summary:', fetchError);
+        setMeetingSummary(null);
+        setHydratedSummaryStatus('idle');
+        setHydratedSummaryError(null);
       } finally {
-        setIsLoading(false);
+        if (isCurrentRequest()) setIsLoading(false);
       }
     };
 
-    loadData();
-  }, [meetingId]);
+    void loadData();
+
+    return () => {
+      requestGeneration.invalidate();
+    };
+  }, [meetingId, startSummaryPolling]);
 
   // Auto-generation check: runs when meeting is loaded with no summary
   useEffect(() => {
@@ -361,6 +366,8 @@ function MeetingDetailsContent() {
   return <PageContent
     meeting={meetingDetails}
     summaryData={meetingSummary}
+    hydratedSummaryStatus={hydratedSummaryStatus}
+    hydratedSummaryError={hydratedSummaryError}
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {

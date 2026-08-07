@@ -23,18 +23,10 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
     const fetchModelConfig = async () => {
       setIsLoading(true);
       try {
-        console.log('🔄 Fetching model configuration from database...');
         const data = await invokeTauri('api_get_model_config', {}) as any;
         if (data && data.provider !== null) {
-          console.log('✅ Loaded model config from database:', {
-            provider: data.provider,
-            model: data.model,
-            whisperModel: data.whisperModel,
-            hasApiKey: !!data.apiKey,
-            ollamaEndpoint: data.ollamaEndpoint || 'default'
-          });
           // Fetch API key if not included and provider requires it
-          if (data.provider !== 'ollama' && data.provider !== 'custom-openai' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && !data.apiKey) {
             try {
               const apiKeyData = await invokeTauri('api_get_api_key', {
                 provider: data.provider
@@ -59,11 +51,6 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
                 data.topP = customConfig.topP || null;
                 // For custom-openai, model field should match customOpenAIModel
                 data.model = customConfig.model || data.model;
-                console.log('✅ Loaded custom OpenAI config:', {
-                  displayName: customConfig.displayName,
-                  endpoint: customConfig.endpoint,
-                  model: customConfig.model,
-                });
               }
             } catch (err) {
               console.error('Failed to fetch custom OpenAI config:', err);
@@ -90,7 +77,6 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
     const setupListener = async () => {
       const { listen } = await import('@tauri-apps/api/event');
       const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
-        console.log('Meeting details received model-config-updated event:', event.payload);
         setModelConfig(event.payload);
       });
 
@@ -116,7 +102,6 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
         apiKey: configToSave.apiKey ?? null,
         ollamaEndpoint: configToSave.ollamaEndpoint ?? null
       };
-      console.log('Saving model config with payload:', payload);
 
       // Track model configuration change
       if (updatedConfig && (

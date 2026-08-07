@@ -10,6 +10,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import Analytics from '@/lib/analytics';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { AUTOMATIC_MEETING_STOP_REQUEST_KEY } from '@/lib/automatic-meeting-lifecycle';
 
 interface RecordingControlsProps {
   isRecording: boolean;
@@ -87,7 +88,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     if (isStarting || isValidatingModel) return;
     console.log('Starting recording...');
     console.log('Selected devices:', selectedDevices);
-    console.log('Meeting name:', meetingName);
+    console.log('Meeting name is set:', Boolean(meetingName));
     console.log('Current isRecording state:', isRecording);
 
     setShowPlayback(false);
@@ -144,7 +145,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       const dataDir = await appDataDir();
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const savePath = `${dataDir}/recording-${timestamp}.wav`;
-      console.log('Saving recording to:', savePath);
       console.log('About to call stop_recording command');
       const result = await invoke('stop_recording', {
         args: {
@@ -201,6 +201,29 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     await stopRecordingAction();
   }, [isRecording, isStarting, isStopping, stopRecordingAction, onStopInitiated]);
 
+  // MeetingDetectionProvider emits this only for a recording that it started.
+  // Reuse the normal stop path so audio flushing, transcription completion,
+  // database persistence, and summary generation remain identical to a manual
+  // stop.
+  useEffect(() => {
+    const handleAutomaticMeetingStop = () => {
+      if (sessionStorage.getItem(AUTOMATIC_MEETING_STOP_REQUEST_KEY) !== 'true') {
+        return;
+      }
+      if (!isRecording || isStarting || isStopping) {
+        return;
+      }
+      sessionStorage.removeItem(AUTOMATIC_MEETING_STOP_REQUEST_KEY);
+      void handleStopRecording();
+    };
+
+    window.addEventListener('stop-recording-automatically', handleAutomaticMeetingStop);
+    handleAutomaticMeetingStop();
+    return () => {
+      window.removeEventListener('stop-recording-automatically', handleAutomaticMeetingStop);
+    };
+  }, [handleStopRecording, isRecording, isStarting, isStopping]);
+
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;
 
@@ -252,7 +275,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         // Transcript error listener - handles both regular and actionable errors
         const transcriptErrorUnsubscribe = await listen('transcript-error', (event) => {
           console.log('transcript-error event received:', event);
-          console.error('Transcription error received:', event.payload);
           const errorMessage = event.payload as string;
 
           Analytics.trackTranscriptionError(errorMessage);
@@ -274,7 +296,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         // Transcription error listener - handles structured error objects with actionable flag
         const transcriptionErrorUnsubscribe = await listen('transcription-error', (event) => {
           console.log('transcription-error event received:', event);
-          console.error('Transcription error received:', event.payload);
 
           let errorMessage: string;
           let isActionable = false;

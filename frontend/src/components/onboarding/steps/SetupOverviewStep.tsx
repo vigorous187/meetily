@@ -3,6 +3,7 @@ import { Info } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { OnboardingContainer } from '../OnboardingContainer';
 import { useOnboarding } from '@/contexts/OnboardingContext';
+import { invoke } from '@tauri-apps/api/core';
 import {
   Tooltip,
   TooltipContent,
@@ -97,14 +98,13 @@ export function SetupOverviewStep() {
             Let's Go
           </Button>
           <div className="text-center">
-            <a
-              href="https://github.com/Zackriya-Solutions/meeting-minutes"
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              type="button"
+              onClick={() => invoke('open_external_url', { url: 'https://github.com/Zackriya-Solutions/meeting-minutes' })}
               className="text-xs text-gray-600 hover:underline"
             >
               Report issues on GitHub
-            </a>
+            </button>
           </div>
         </div>
       </div>

@@ -33,7 +33,14 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
   useEffect(() => {
     console.log('[useMeetingData] Syncing summary data from prop:', summaryData ? 'present' : 'null');
     setAiSummary(summaryData);
-  }, [summaryData]); // Only trigger when parent prop changes, not when aiSummary changes
+  }, [meeting.id, summaryData]);
+
+  useEffect(() => {
+    setMeetingTitle(meeting.title || '+ New Call');
+    setIsEditingTitle(false);
+    setIsTitleDirty(false);
+    setIsSummaryDirty(false);
+  }, [meeting.id, meeting.title]);
 
   // Handlers
   const handleTitleChange = useCallback((newTitle: string) => {
@@ -74,12 +81,6 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
   }, [meeting.id, meetingTitle, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
   const handleSaveSummary = useCallback(async (summary: Summary | { markdown?: string; summary_json?: any[] }) => {
-    console.log('📄 handleSaveSummary called with:', {
-      hasMarkdown: 'markdown' in summary,
-      hasSummaryJson: 'summary_json' in summary,
-      summaryKeys: Object.keys(summary)
-    });
-
     try {
       let formattedSummary: any;
 
@@ -113,6 +114,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
       } else {
         setError('Failed to save meeting summary: Unknown error');
       }
+      throw error;
     }
   }, [meeting.id, meetingTitle]);
 
@@ -121,7 +123,8 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     try {
       // Save meeting title only if changed
       if (isTitleDirty) {
-        await handleSaveMeetingTitle();
+        const saved = await handleSaveMeetingTitle();
+        if (!saved) throw new Error('Failed to save meeting title');
       }
 
       // Save BlockNote editor changes if dirty
@@ -143,7 +146,6 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
 
   // Update meeting title from external source (e.g., AI summary)
   const updateMeetingTitle = useCallback((newTitle: string) => {
-    console.log('📝 Updating meeting title to:', newTitle);
     setMeetingTitle(newTitle);
     const updatedMeetings = sidebarMeetings.map((m: CurrentMeeting) =>
       m.id === meeting.id ? { id: m.id, title: newTitle } : m

@@ -1,4 +1,3 @@
-use posthog_rs::{Client, Event};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,7 +44,7 @@ impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            host: Some("https://us.i.posthog.com".to_string()),
+            host: None,
             enabled: false,
         }
     }
@@ -76,22 +75,18 @@ impl UserSession {
 }
 
 pub struct AnalyticsClient {
-    client: Option<Arc<Client>>,
     config: AnalyticsConfig,
     user_id: Arc<Mutex<Option<String>>>,
     current_session: Arc<Mutex<Option<UserSession>>>,
 }
 
 impl AnalyticsClient {
-    pub async fn new(config: AnalyticsConfig) -> Self {
-        let client = if config.enabled && !config.api_key.is_empty() {
-            Some(Arc::new(posthog_rs::client(config.api_key.as_str()).await))
-        } else {
-            None
-        };
-
+    pub async fn new(mut config: AnalyticsConfig) -> Self {
+        // Hardened local build: telemetry is intentionally disabled at the backend.
+        config.enabled = false;
+        config.api_key.clear();
+        config.host = None;
         Self {
-            client,
             config,
             user_id: Arc::new(Mutex::new(None)),
             current_session: Arc::new(Mutex::new(None)),
@@ -99,72 +94,15 @@ impl AnalyticsClient {
     }
 
     pub async fn identify(&self, user_id: String, properties: Option<HashMap<String, String>>) -> Result<(), String> {
-        let client = match &self.client {
-            Some(client) => Arc::clone(client),
-            None => return Ok(()),
-        };
-
-        // Store user ID for future events
+        // Preserve local session behavior without sending data off-device.
         *self.user_id.lock().await = Some(user_id.clone());
-
-        let properties = sanitize_analytics_properties(properties.unwrap_or_default());
-        
-        let mut event = Event::new("$identify", &user_id);
-        
-        // Add user properties
-        for (key, value) in properties {
-            if let Err(e) = event.insert_prop(&key, value) {
-                eprintln!("Failed to add property {}: {}", key, e);
-            }
-        }
-        
-        if let Err(e) = client.capture(event).await {
-            eprintln!("Failed to identify user: {}", e);
-        }
-        
+        let _ = sanitize_analytics_properties(properties.unwrap_or_default());
         Ok(())
     }
 
     pub async fn track_event(&self, event_name: &str, properties: Option<HashMap<String, String>>) -> Result<(), String> {
-        let client = match &self.client {
-            Some(client) => Arc::clone(client),
-            None => return Ok(()),
-        };
-
-        let user_id = match self.user_id.lock().await.clone() {
-            Some(id) => id,
-            None => {
-                // Don't create anonymous users, wait for proper identification
-                log::warn!("Attempted to track event '{}' before user identification", event_name);
-                return Ok(());
-            }
-        };
-
-        let event_name = event_name.to_string();
-        let mut properties = sanitize_analytics_properties(properties.unwrap_or_default());
-
-        // Add app version to all events
-        properties.insert("app_version".to_string(), env!("CARGO_PKG_VERSION").to_string());
-
-        // Add session information to all events
-        if let Some(session) = self.current_session.lock().await.as_ref() {
-            properties.insert("session_id".to_string(), session.session_id.clone());
-            properties.insert("session_duration".to_string(), session.duration_seconds().to_string());
-        }
-        
-        let mut event = Event::new(&event_name, &user_id);
-        
-        // Add event properties
-        for (key, value) in properties {
-            if let Err(e) = event.insert_prop(&key, value) {
-                log::warn!("Failed to add property {}: {}", key, e);
-            }
-        }
-        
-        if let Err(e) = client.capture(event).await {
-            log::warn!("Failed to track event {}: {}", event_name, e);
-        }
-        
+        let _ = event_name;
+        let _ = sanitize_analytics_properties(properties.unwrap_or_default());
         Ok(())
     }
 
@@ -417,37 +355,11 @@ impl AnalyticsClient {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled && self.client.is_some()
+        false
     }
 
     pub async fn set_user_properties(&self, properties: HashMap<String, String>) -> Result<(), String> {
-        let client = match &self.client {
-            Some(client) => Arc::clone(client),
-            None => return Ok(()),
-        };
-
-        let user_id = match self.user_id.lock().await.clone() {
-            Some(id) => id,
-            None => {
-                eprintln!("Warning: Attempted to set user properties before user identification");
-                return Ok(());
-            }
-        };
-        
-        let properties = sanitize_analytics_properties(properties);
-        let mut event = Event::new("$set", &user_id);
-        
-        // Add user properties
-        for (key, value) in properties {
-            if let Err(e) = event.insert_prop(&key, value) {
-                eprintln!("Failed to add property {}: {}", key, e);
-            }
-        }
-        
-        if let Err(e) = client.capture(event).await {
-            eprintln!("Failed to set user properties: {}", e);
-        }
-        
+        let _ = sanitize_analytics_properties(properties);
         Ok(())
     }
 }

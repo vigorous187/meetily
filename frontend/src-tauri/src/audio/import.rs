@@ -93,13 +93,6 @@ pub struct ImportError {
     pub error: String,
 }
 
-/// Warning emitted during import (non-fatal)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportWarning {
-    pub warning: String,
-    pub details: Option<String>,
-}
-
 /// Response when import is started
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportStarted {
@@ -360,6 +353,7 @@ async fn run_import<R: Runtime>(
         .await
         .map_err(|e| anyhow!("Copy task join error: {}", e))?
         .map_err(|e| anyhow!("Failed to copy audio file: {}", e))?;
+    crate::path_security::harden_private_file(&dest_path).map_err(anyhow::Error::msg)?;
 
     info!("Copied audio to: {}", dest_path.display());
 
@@ -484,19 +478,13 @@ async fn run_import<R: Runtime>(
 
     if total_segments == 0 {
         warn!("No speech detected in audio");
-
-        // Emit warning to frontend
-        let _ = app.emit(
-            "import-warning",
-            ImportWarning {
-                warning: "No speech detected in audio file".to_string(),
-                details: Some(
-                    "The file was imported successfully, but VAD did not detect any speech. \
-                     The meeting was created but contains no transcripts.".to_string()
-                ),
-            },
-        );
-        // Still create the meeting, just with no transcripts
+        // A meeting with no transcript is not a successful import. Remove the
+        // provisional private folder before returning so the wrapper emits
+        // `import-error` only and no empty meeting is persisted.
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+        return Err(anyhow!(
+            "No speech was detected in the audio file; no meeting was created"
+        ));
     }
 
     // Check for cancellation
@@ -620,6 +608,13 @@ async fn run_import<R: Runtime>(
         "Transcription complete: {} segments transcribed out of {}, avg confidence: {:.2}",
         transcribed_count, processable_count, avg_confidence
     );
+
+    if transcribed_count == 0 {
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+        return Err(anyhow!(
+            "Speech was detected, but transcription produced no text; no meeting was created"
+        ));
+    }
 
     // Check for cancellation
     if IMPORT_CANCELLED.load(Ordering::SeqCst) {
@@ -903,7 +898,9 @@ fn write_import_metadata(
 
     let json_string = serde_json::to_string_pretty(&json)?;
     std::fs::write(&temp_path, &json_string)?;
+    crate::path_security::harden_private_file(&temp_path).map_err(anyhow::Error::msg)?;
     std::fs::rename(&temp_path, &metadata_path)?;
+    crate::path_security::harden_private_file(&metadata_path).map_err(anyhow::Error::msg)?;
 
     info!("Wrote metadata.json to {}", metadata_path.display());
     Ok(())
@@ -1181,6 +1178,8 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                source: "unknown".to_string(),
+                speaker_id: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1189,6 +1188,8 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                source: "unknown".to_string(),
+                speaker_id: None,
             },
         ];
 
@@ -1252,7 +1253,6 @@ mod tests {
         assert!(path.exists(), "Audio file not found: {}", audio_path);
 
         // Step 1: Decode
-        println!("Decoding {}...", audio_path);
         let decoded = crate::audio::decoder::decode_audio_file(path)
             .expect("Failed to decode audio file");
         println!(
@@ -1284,6 +1284,10 @@ mod tests {
 
             let total_segments = segments.len();
             println!("Found {} segments", total_segments);
+            assert!(
+                total_segments > 0,
+                "No speech detected in real-audio regression fixture"
+            );
 
             if !segments.is_empty() {
                 let durations: Vec<f64> = segments.iter()
@@ -1307,7 +1311,7 @@ mod tests {
                 println!("Segments >25s (would be split): {}", oversized);
 
                 // Basic sanity checks
-                assert!(total_speech > 0.0, "No speech detected");
+                assert!(total_speech > 0.0, "Speech segments have zero duration");
                 for (i, seg) in segments.iter().enumerate() {
                     assert!(!seg.samples.is_empty(), "Segment {} has no samples", i);
                     assert!(

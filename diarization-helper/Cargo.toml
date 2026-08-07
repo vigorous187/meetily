@@ -1,0 +1,25 @@
+[package]
+name = "diarization-helper"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "Local-only, process-isolated speaker diarization helper for Meetily"
+publish = false
+
+[features]
+default = ["sherpa"]
+sherpa = ["dep:sherpa-onnx", "dep:sherpa-onnx-sys"]
+
+[dependencies]
+hound = "=3.5.1"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"
+sherpa-onnx = { version = "=1.13.4", default-features = false, features = ["static"], optional = true }
+# Keep the native crate exact as well; sherpa-onnx's transitive declaration uses a
+# compatible-version requirement, which is too broad for a reviewed native binary.
+sherpa-onnx-sys = { version = "=1.13.4", default-features = false, features = ["static"], optional = true }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

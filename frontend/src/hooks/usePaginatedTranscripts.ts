@@ -1,13 +1,12 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSegmentData } from "@/types";
+import { RequestGeneration } from "@/lib/request-generation";
 
 const DEFAULT_PAGE_SIZE = 100;
 
 interface UsePaginatedTranscriptsProps {
     meetingId: string | null;
-    /** Optional initial timestamp (in seconds) from URL for loading the correct page */
-    initialTimestamp?: number;
 }
 
 interface UsePaginatedTranscriptsReturn {
@@ -37,12 +36,14 @@ function convertTranscriptsToSegments(transcripts: Transcript[]): TranscriptSegm
         endTime: t.audio_end_time,
         text: t.text,
         confidence: t.confidence,
+        source: t.source,
+        speakerId: t.speaker_id,
+        speakerName: t.speaker_name,
     }));
 }
 
 export function usePaginatedTranscripts({
     meetingId,
-    initialTimestamp,
 }: UsePaginatedTranscriptsProps): UsePaginatedTranscriptsReturn {
     const [metadata, setMetadata] = useState<MeetingMetadata | null>(null);
     const [transcripts, setTranscripts] = useState<Transcript[]>([]);
@@ -56,9 +57,9 @@ export function usePaginatedTranscripts({
     const loadedMeetingIdRef = useRef<string | null>(null);
     const isLoadingRef = useRef(false);
     const lastLoadTimeRef = useRef(0); // Debounce protection
+    const requestGenerationRef = useRef(new RequestGeneration());
 
-    // Reset state when meeting changes
-    const reset = useCallback(() => {
+    const resetState = useCallback(() => {
         setMetadata(null);
         setTranscripts([]);
         setTotalCount(0);
@@ -67,19 +68,30 @@ export function usePaginatedTranscripts({
         setHasMore(false);
         setError(null);
         offsetRef.current = 0;
+        isLoadingRef.current = false;
+        lastLoadTimeRef.current = 0;
     }, []);
 
+    // Public reset also invalidates every in-flight native request.
+    const reset = useCallback(() => {
+        requestGenerationRef.current.invalidate();
+        loadedMeetingIdRef.current = null;
+        resetState();
+    }, [resetState]);
+
     // Load meeting metadata
-    const loadMetadata = useCallback(async (): Promise<MeetingMetadata | null> => {
+    const loadMetadata = useCallback(async (generation: number): Promise<MeetingMetadata | null> => {
         if (!meetingId) return null;
 
         try {
             const data = await invoke<MeetingMetadata>('api_get_meeting_metadata', {
                 meetingId,
             });
+            if (!requestGenerationRef.current.isCurrent(generation)) return null;
             setMetadata(data);
             return data;
         } catch (err) {
+            if (!requestGenerationRef.current.isCurrent(generation)) return null;
             console.error('Failed to load meeting metadata:', err);
             setError('Failed to load meeting details');
             return null;
@@ -89,7 +101,8 @@ export function usePaginatedTranscripts({
     // Load transcripts at specific offset
     const loadTranscriptsAtOffset = useCallback(async (
         offset: number,
-        append: boolean = true
+        append: boolean,
+        generation: number,
     ): Promise<Transcript[]> => {
         if (!meetingId) return [];
 
@@ -102,6 +115,7 @@ export function usePaginatedTranscripts({
                     offset,
                 }
             );
+            if (!requestGenerationRef.current.isCurrent(generation)) return [];
 
             const newTranscripts = response.transcripts;
 
@@ -125,6 +139,7 @@ export function usePaginatedTranscripts({
 
             return newTranscripts;
         } catch (err) {
+            if (!requestGenerationRef.current.isCurrent(generation)) return [];
             console.error('Failed to load transcripts:', err);
             setError('Failed to load transcripts');
             return [];
@@ -144,11 +159,14 @@ export function usePaginatedTranscripts({
         lastLoadTimeRef.current = now;
         isLoadingRef.current = true;
         setIsLoadingMore(true);
+        const generation = requestGenerationRef.current.begin();
         try {
-            await loadTranscriptsAtOffset(offsetRef.current, true);
+            await loadTranscriptsAtOffset(offsetRef.current, true, generation);
         } finally {
-            setIsLoadingMore(false);
-            isLoadingRef.current = false;
+            if (requestGenerationRef.current.isCurrent(generation)) {
+                setIsLoadingMore(false);
+                isLoadingRef.current = false;
+            }
         }
     }, [hasMore, meetingId, loadTranscriptsAtOffset, isLoading]);
 
@@ -156,20 +174,28 @@ export function usePaginatedTranscripts({
     const refetch = useCallback(async () => {
         if (!meetingId) return;
 
-        reset();
+        const requestGeneration = requestGenerationRef.current;
+        const generation = requestGeneration.begin();
+        resetState();
         setIsLoading(true);
         try {
-            await loadMetadata();
-            await loadTranscriptsAtOffset(0, false);
+            await loadMetadata(generation);
+            if (!requestGeneration.isCurrent(generation)) return;
+            await loadTranscriptsAtOffset(0, false, generation);
         } finally {
-            setIsLoading(false);
+            if (requestGeneration.isCurrent(generation)) {
+                setIsLoading(false);
+            }
         }
-    }, [meetingId, reset, loadMetadata, loadTranscriptsAtOffset]);
+    }, [meetingId, resetState, loadMetadata, loadTranscriptsAtOffset]);
 
     // Initial load
     useEffect(() => {
         if (!meetingId) {
-            reset();
+            requestGenerationRef.current.invalidate();
+            loadedMeetingIdRef.current = null;
+            resetState();
+            setIsLoading(false);
             return;
         }
 
@@ -177,20 +203,29 @@ export function usePaginatedTranscripts({
         if (loadedMeetingIdRef.current === meetingId) return;
         loadedMeetingIdRef.current = meetingId;
 
-        reset();
+        const requestGeneration = requestGenerationRef.current;
+        const generation = requestGeneration.begin();
+        resetState();
 
         const loadInitial = async () => {
             setIsLoading(true);
             try {
-                await loadMetadata();
-                await loadTranscriptsAtOffset(0, false);
+                await loadMetadata(generation);
+                if (!requestGeneration.isCurrent(generation)) return;
+                await loadTranscriptsAtOffset(0, false, generation);
             } finally {
-                setIsLoading(false);
+                if (requestGeneration.isCurrent(generation)) {
+                    setIsLoading(false);
+                }
             }
         };
 
-        loadInitial();
-    }, [meetingId, reset, loadMetadata, loadTranscriptsAtOffset]);
+        void loadInitial();
+
+        return () => {
+            requestGeneration.invalidate();
+        };
+    }, [meetingId, resetState, loadMetadata, loadTranscriptsAtOffset]);
 
     // Convert to segments (memoized)
     const segments = useMemo(() =>

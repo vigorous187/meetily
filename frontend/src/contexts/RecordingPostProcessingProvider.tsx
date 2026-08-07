@@ -34,7 +34,6 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
       try {
         // Listen for recording-stop-complete event from Rust
         unlistenFn = await listen<boolean>('recording-stop-complete', (event) => {
-          console.log('[RecordingPostProcessing] Received recording-stop-complete event:', event.payload);
 
           // Call the post-processing handler
           // event.payload is the callApi boolean (true for normal stops)

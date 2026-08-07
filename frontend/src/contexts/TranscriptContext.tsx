@@ -271,11 +271,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           });
         });
 
-        // Log the processing summary
-        const logMessage = forceFlush
-          ? `Force flush processed ${allNewTranscripts.length} transcripts (${sortedTranscripts.length} sequential, ${forceFlushTranscripts.length} forced)`
-          : `Processed ${allNewTranscripts.length} transcripts (${sortedTranscripts.length} sequential, ${recentTranscripts.length} recent, ${staleTranscripts.length} stale)`;
-        console.log(logMessage);
       }
     };
 
@@ -286,15 +281,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       try {
         console.log('🔥 Setting up MAIN transcript listener during component initialization...');
         unlistenFn = await transcriptService.onTranscriptUpdate((update) => {
-          const now = Date.now();
-          console.log('🎯 MAIN LISTENER: Received transcript update:', {
-            sequence_id: update.sequence_id,
-            text: update.text.substring(0, 50) + '...',
-            timestamp: update.timestamp,
-            is_partial: update.is_partial,
-            received_at: new Date(now).toISOString(),
-            buffer_size_before: transcriptBuffer.size
-          });
 
           // Check for duplicate sequence_id before processing
           if (transcriptBuffer.has(update.sequence_id)) {
@@ -315,6 +301,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: update.audio_start_time,
             audio_end_time: update.audio_end_time,
             duration: update.duration,
+            source: update.source === 'mic' || update.source === 'system' ? update.source : 'unknown',
+            speaker_id: update.source === 'mic' ? 'you' : update.source === 'system' ? 'remote' : undefined,
+            speaker_name: update.source === 'mic' ? 'You' : update.source === 'system' ? 'Remote speaker' : undefined,
           };
 
           // Add to buffer
@@ -383,6 +372,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: segment.audio_start_time,
             audio_end_time: segment.audio_end_time,
             duration: segment.duration,
+            source: segment.source,
+            speaker_id: segment.speaker_id,
+            speaker_name: segment.speaker_id === 'you' ? 'You' : segment.speaker_id === 'remote' ? 'Remote speaker' : undefined,
           }));
 
           setTranscripts(formattedTranscripts);
@@ -391,7 +383,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           // Fetch meeting name from backend
           const meetingName = await recordingService.getRecordingMeetingName();
           if (meetingName) {
-            console.log('[Reload Sync] Retrieved meeting name:', meetingName);
+            console.log('[Reload Sync] Retrieved meeting name');
             setMeetingTitle(meetingName);
             console.log('[Reload Sync] ✅ Meeting title synced successfully');
           }
@@ -406,13 +398,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Manual transcript update handler (for RecordingControls component)
   const addTranscript = useCallback((update: TranscriptUpdate) => {
-    console.log('🎯 addTranscript called with:', {
-      sequence_id: update.sequence_id,
-      text: update.text.substring(0, 50) + '...',
-      timestamp: update.timestamp,
-      is_partial: update.is_partial
-    });
-
     const newTranscript: Transcript = {
       id: update.sequence_id ? update.sequence_id.toString() : Date.now().toString(),
       text: update.text,
@@ -424,6 +409,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       audio_start_time: update.audio_start_time,
       audio_end_time: update.audio_end_time,
       duration: update.duration,
+      source: update.source === 'mic' || update.source === 'system' ? update.source : 'unknown',
+      speaker_id: update.source === 'mic' ? 'you' : update.source === 'system' ? 'remote' : undefined,
+      speaker_name: update.source === 'mic' ? 'You' : update.source === 'system' ? 'Remote speaker' : undefined,
     };
 
     setTranscripts(prev => {
@@ -434,7 +422,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         t => t.text === update.text && t.timestamp === update.timestamp
       );
       if (exists) {
-        console.log('🚫 Duplicate transcript detected, skipping:', update.text.substring(0, 30) + '...');
+        console.log('🚫 Duplicate transcript detected; skipping');
         return prev;
       }
 
@@ -443,12 +431,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       const sorted = updated.sort((a, b) => (a.sequence_id || 0) - (b.sequence_id || 0));
 
       console.log('✅ Added new transcript. New count:', sorted.length);
-      console.log('📝 Latest transcript:', {
-        id: newTranscript.id,
-        text: newTranscript.text.substring(0, 30) + '...',
-        sequence_id: newTranscript.sequence_id
-      });
-
       return sorted;
     });
   }, []);
@@ -465,7 +447,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     };
 
     const fullTranscript = transcripts
-      .map(t => `${formatTime(t.audio_start_time)} ${t.text}`)
+      .map(t => `${formatTime(t.audio_start_time)}${t.speaker_name ? ` ${t.speaker_name}:` : ''} ${t.text}`)
       .join('\n');
     navigator.clipboard.writeText(fullTranscript);
 
@@ -493,8 +475,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
     if (!meetingId) {
       console.error('[IndexedDB] ❌ Cannot mark meeting as saved: No meeting ID available!');
-      console.error('[IndexedDB] currentMeetingId:', currentMeetingId);
-      console.error('[IndexedDB] sessionStorage:', sessionStorage.getItem('indexeddb_current_meeting_id'));
       return;
     }
 

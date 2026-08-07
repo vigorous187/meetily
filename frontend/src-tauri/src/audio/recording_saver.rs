@@ -22,7 +22,13 @@ pub struct TranscriptSegment {
     pub display_time: String,   // Formatted time for display like "[02:15]"
     pub confidence: f32,
     pub sequence_id: u64,
+    #[serde(default = "default_source")]
+    pub source: String,
+    #[serde(default)]
+    pub speaker_id: Option<String>,
 }
+
+fn default_source() -> String { "unknown".to_string() }
 
 /// Meeting metadata structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +135,8 @@ impl RecordingSaver {
             display_time: "[00:00]".to_string(),
             confidence: 1.0,
             sequence_id: 0,
+            source: "unknown".to_string(),
+            speaker_id: None,
         };
         self.add_transcript_segment(segment);
     }
@@ -277,7 +285,10 @@ impl RecordingSaver {
 
         let json_string = serde_json::to_string_pretty(metadata)?;
         std::fs::write(&temp_path, json_string)?;
+        crate::path_security::harden_private_file(&temp_path).map_err(anyhow::Error::msg)?;
         std::fs::rename(&temp_path, &metadata_path)?;  // Atomic
+        crate::path_security::harden_private_file(&metadata_path)
+            .map_err(anyhow::Error::msg)?;
 
         Ok(())
     }
@@ -318,6 +329,8 @@ impl RecordingSaver {
                 error!("Failed to write transcript temp file to {}: {}", temp_path.display(), e);
                 anyhow::anyhow!("Failed to write temp file: {}", e)
             })?;
+        crate::path_security::harden_private_file(&temp_path)
+            .map_err(anyhow::Error::msg)?;
 
         // Verify temp file was written correctly
         if !temp_path.exists() {
@@ -332,6 +345,8 @@ impl RecordingSaver {
                        temp_path.display(), transcript_path.display(), e);
                 anyhow::anyhow!("Failed to rename transcript file: {}", e)
             })?;
+        crate::path_security::harden_private_file(&transcript_path)
+            .map_err(anyhow::Error::msg)?;
 
         info!("✅ Successfully wrote transcripts.json with {} segments", segments_clone.len());
         Ok(())
