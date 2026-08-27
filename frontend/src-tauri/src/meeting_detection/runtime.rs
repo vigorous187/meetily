@@ -108,6 +108,13 @@ pub async fn set_auto_capture_enabled<R: Runtime>(
     store.save().map_err(|error| error.to_string())?;
 
     if enabled {
+        let launch_status = super::autostart::set_launch_at_login(app.clone(), true);
+        if !launch_status.enabled {
+            log::warn!(
+                "Automatic capture enabled but launch at login could not be enabled: {}",
+                launch_status.message
+            );
+        }
         COORDINATOR
             .lock()
             .map_err(|_| "Automatic capture state is unavailable".to_string())?
@@ -170,7 +177,7 @@ fn start_detector_worker<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         let worker_app = app.clone();
         let owner_thread = std::thread::Builder::new()
             .name("meetily-auto-capture".to_string())
-            .spawn(move || run_macos_detector(worker_app, thread_stop))
+            .spawn(move || run_macos_detector_supervised(worker_app, thread_stop))
             .map_err(|error| {
                 RUNNING.store(false, Ordering::SeqCst);
                 format!("Could not start automatic capture: {error}")
@@ -205,6 +212,30 @@ fn stop_detector_worker() -> Result<(), String> {
         coordinator.set_detector_running(false);
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_detector_supervised<R: Runtime>(app: AppHandle<R>, stop: Arc<AtomicBool>) {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use super::diagnostics::{record, JournalEntry, JournalEvent};
+
+    record(JournalEntry::new(JournalEvent::DetectorStarted));
+    while RUNNING.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_macos_detector(app.clone(), stop.clone())
+        }));
+        if result.is_ok() || !RUNNING.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
+            break;
+        }
+        record(
+            JournalEntry::new(JournalEvent::WorkerRestarted)
+                .error_code("detector_worker_panicked"),
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    RUNNING.store(false, Ordering::Release);
+    record(JournalEntry::new(JournalEvent::DetectorStopped));
+    mark_worker_stopped(&app, None);
 }
 
 #[cfg(target_os = "macos")]
@@ -257,9 +288,6 @@ fn run_macos_detector<R: Runtime>(app: AppHandle<R>, stop: Arc<AtomicBool>) {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-
-    RUNNING.store(false, Ordering::Release);
-    mark_worker_stopped(&app, None);
 }
 
 fn drain_outcomes<R: Runtime>(

@@ -6,8 +6,11 @@
 //! An inactive process on its own is never sufficient. A filtered meeting
 //! window or recognized system-audio producer can request a prompt.
 
-mod detector;
 mod coordinator;
+mod detector;
+pub mod autostart;
+pub mod diagnostics;
+pub mod permissions;
 pub mod runtime;
 mod signals;
 
@@ -27,8 +30,16 @@ pub use runtime::{
     stop_meeting_detection,
 };
 pub use signals::{
-    classify_active_candidate, classify_candidate, CandidateApp, ObservedApplication,
-    SignalProvider, SignalSnapshot,
+    classify_active_candidate, classify_candidate, classify_meeting_evidence, CandidateApp,
+    CandidateEvidence, EvidenceConfidence, ObservedApplication, SignalProvider, SignalSnapshot,
+};
+
+pub use permissions::{
+    get_auto_capture_permissions, request_auto_capture_permission, PermissionKind, PermissionState,
+    PermissionStatus,
+};
+pub use autostart::{
+    get_launch_at_login_status, set_launch_at_login, LaunchAtLoginStatus,
 };
 
 #[cfg(target_os = "macos")]

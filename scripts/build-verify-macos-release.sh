@@ -12,6 +12,21 @@ rust_toolchain_dir="${MEETILY_RUST_TOOLCHAIN_DIR:-/Users/user/.local/share/meeti
 : "${CARGO_HOME:?Set CARGO_HOME to the reviewed offline Cargo home}"
 : "${MEETILY_ARCHIVE_PATH:?Set MEETILY_ARCHIVE_PATH to a new .zip output path}"
 : "${MEETILY_DMG_PATH:?Set MEETILY_DMG_PATH to a new .dmg output path}"
+signing_identity="${MEETILY_SIGNING_IDENTITY:-}"
+dev_adhoc="${MEETILY_DEV_ADHOC:-0}"
+if [[ -z "$signing_identity" ]]; then
+  if [[ "$dev_adhoc" == "1" ]]; then
+    signing_identity="-"
+    echo "Building an explicit ad-hoc development artifact; it must remain outside /Applications" >&2
+  else
+    echo "Set MEETILY_SIGNING_IDENTITY to an Apple Development identity from Xcode" >&2
+    exit 2
+  fi
+fi
+if [[ "$signing_identity" != "-" && "$signing_identity" != "Apple Development:"* ]]; then
+  echo "Internal builds require an Apple Development signing identity" >&2
+  exit 2
+fi
 
 case "$CARGO_HOME" in
   /*) ;;
@@ -51,6 +66,7 @@ esac
 
 required_tools=(
   /usr/bin/codesign
+  /usr/bin/security
   /usr/bin/ditto
   /usr/bin/file
   /usr/bin/hdiutil
@@ -65,6 +81,10 @@ required_tools=(
 for tool in "${required_tools[@]}"; do
   [[ -x "$tool" ]] || { echo "Required tool is unavailable: $tool" >&2; exit 2; }
 done
+if [[ "$signing_identity" != "-" ]] && ! /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -Fq "$signing_identity"; then
+  echo "Requested Apple Development identity is not available in the keychain" >&2
+  exit 2
+fi
 [[ -x /usr/libexec/PlistBuddy ]] || {
   echo "Required tool is unavailable: /usr/libexec/PlistBuddy" >&2
   exit 2
@@ -138,11 +158,11 @@ for sidecar in "${sidecars[@]}"; do
     echo "Packaged sidecar is missing or unsafe: $sidecar_path" >&2
     exit 4
   }
-  /usr/bin/codesign --force --sign - --options runtime --timestamp=none "$sidecar_path"
+  /usr/bin/codesign --force --sign "$signing_identity" --options runtime --timestamp=none "$sidecar_path"
 done
 
 # Seal resources and sign only the main executable with the reviewed entitlement.
-/usr/bin/codesign --force --sign - --options runtime --timestamp=none \
+/usr/bin/codesign --force --sign "$signing_identity" --options runtime --timestamp=none \
   --entitlements "$tauri_dir/entitlements.plist" \
   "$app_path"
 
@@ -187,6 +207,9 @@ verify_macho() {
 verify_signed_bundle() {
   local bundle="$1"
   /usr/bin/codesign --verify --deep --strict --verbose=4 "$bundle"
+  if [[ "$signing_identity" != "-" ]]; then
+    /bin/bash "$repo_root/scripts/validate-macos-signing.sh" "$bundle"
+  fi
 
   local main_entitlements
   main_entitlements="$(/usr/bin/codesign -d --entitlements :- "$bundle" 2>/dev/null)"
@@ -257,12 +280,15 @@ verify_signed_bundle "$extracted_app"
 /usr/bin/ditto "$app_path" "$dmg_stage/$app_name"
 /bin/ln -s /Applications "$dmg_stage/Applications"
 /usr/bin/hdiutil create -quiet \
-  -volname "Meetily Plus 0.4.3" \
+  -volname "Meetily Plus 0.4.4" \
   -srcfolder "$dmg_stage" \
   -format UDZO \
   "$MEETILY_DMG_PATH"
-/usr/bin/codesign --force --sign - --timestamp=none "$MEETILY_DMG_PATH"
+/usr/bin/codesign --force --sign "$signing_identity" --timestamp=none "$MEETILY_DMG_PATH"
 /usr/bin/codesign --verify --strict --verbose=4 "$MEETILY_DMG_PATH"
+if [[ "$signing_identity" != "-" ]]; then
+  /bin/bash "$repo_root/scripts/validate-macos-signing.sh" "$MEETILY_DMG_PATH"
+fi
 
 /usr/bin/hdiutil attach -quiet -readonly -nobrowse -mountpoint "$dmg_mount" "$MEETILY_DMG_PATH"
 dmg_attached=true

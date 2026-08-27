@@ -371,6 +371,7 @@ mod tests {
             applications: vec![ObservedApplication {
                 process_name: "Google Chrome".to_string(),
                 window_title: Some("Daily sync - Google Meet".to_string()),
+                is_audio_output_active: true,
                 ..ObservedApplication::default()
             }],
             recording_active: false,

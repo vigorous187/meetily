@@ -4,6 +4,7 @@ use std::time::Duration;
 /// A supported application or browser service that may be hosting a meeting.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CandidateApp {
+    BrowserCall,
     Zoom,
     MicrosoftTeams,
     FaceTime,
@@ -22,6 +23,7 @@ pub enum CandidateApp {
 impl CandidateApp {
     pub fn display_name(self) -> &'static str {
         match self {
+            Self::BrowserCall => "Browser meeting",
             Self::Zoom => "Zoom",
             Self::MicrosoftTeams => "Microsoft Teams",
             Self::FaceTime => "FaceTime",
@@ -53,6 +55,7 @@ impl CandidateApp {
             Self::RingCentral => 10,
             Self::Riverside => 11,
             Self::Dialpad => 12,
+            Self::BrowserCall => 13,
         }
     }
 }
@@ -69,13 +72,24 @@ impl fmt::Display for CandidateApp {
 /// raw microphone or system-audio samples.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObservedApplication {
+    /// CoreAudio/NSWorkspace process identifier used only for live correlation.
+    pub process_id: Option<i32>,
     pub process_name: String,
     pub bundle_identifier: Option<String>,
     pub executable_path: Option<String>,
     pub window_title: Option<String>,
+    /// Meeting-domain classification produced in memory. Raw URLs are never
+    /// returned by the browser Automation adapter.
+    pub meeting_context: Option<CandidateApp>,
     pub is_frontmost: bool,
     /// Whether macOS reports this recognized app as currently producing audio.
     pub is_using_system_audio: bool,
+    /// Whether CoreAudio reports the process or its mapped host consuming
+    /// microphone/input audio.
+    pub is_audio_input_active: bool,
+    /// Whether CoreAudio reports the process or its mapped host producing
+    /// output audio.
+    pub is_audio_output_active: bool,
     /// Whether this is a provider helper that exists only during an active call.
     pub is_active_call_helper: bool,
 }
@@ -110,7 +124,44 @@ pub fn classify_candidate(applications: &[ObservedApplication]) -> Option<Candid
 /// active system-audio producer, or a provider call-only helper. Browser
 /// candidates always require a filtered meeting title/URL.
 pub fn classify_active_candidate(applications: &[ObservedApplication]) -> Option<CandidateApp> {
-    classify(applications, true)
+    classify_meeting_evidence(applications)
+        .filter(|evidence| evidence.confidence == EvidenceConfidence::High)
+        .map(|evidence| evidence.candidate)
+}
+
+/// Privacy-safe confidence summary consumed by the detector/coordinator.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum EvidenceConfidence {
+    None,
+    Possible,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateEvidence {
+    pub candidate: CandidateApp,
+    pub confidence: EvidenceConfidence,
+    pub meeting_context: bool,
+    pub input_active: bool,
+    pub output_active: bool,
+}
+
+/// Select the strongest current evidence. Confidence, live audio and PID-host
+/// correlation take precedence over the candidate's deterministic tie-breaker.
+pub fn classify_meeting_evidence(
+    applications: &[ObservedApplication],
+) -> Option<CandidateEvidence> {
+    applications
+        .iter()
+        .filter_map(application_evidence)
+        .max_by_key(|evidence| {
+            (
+                evidence.confidence,
+                evidence.input_active as u8 + evidence.output_active as u8,
+                evidence.meeting_context,
+                usize::MAX - evidence.candidate.rank(),
+            )
+        })
 }
 
 fn classify(applications: &[ObservedApplication], require_active: bool) -> Option<CandidateApp> {
@@ -119,8 +170,11 @@ fn classify(applications: &[ObservedApplication], require_active: bool) -> Optio
         .filter(|application| {
             !require_active
                 || application.is_using_system_audio
+                || application.is_audio_input_active
+                || application.is_audio_output_active
                 || application.is_active_call_helper
                 || application.window_title.is_some()
+                || application.meeting_context.is_some()
         })
         .filter_map(|application| {
             classify_application(application).map(|candidate| {
@@ -132,16 +186,76 @@ fn classify(applications: &[ObservedApplication], require_active: bool) -> Optio
         .map(|(_, candidate)| candidate)
 }
 
+fn application_evidence(application: &ObservedApplication) -> Option<CandidateEvidence> {
+    let process_name = normalized(&application.process_name);
+    let bundle = normalized(application.bundle_identifier.as_deref().unwrap_or_default());
+    let executable = normalized(application.executable_path.as_deref().unwrap_or_default());
+    let input_active = application.is_audio_input_active;
+    let output_active = application.is_audio_output_active || application.is_using_system_audio;
+
+    if is_supported_browser(&process_name, &bundle) {
+        let context = application.meeting_context.or_else(|| {
+            application
+                .window_title
+                .as_deref()
+                .and_then(candidate_from_meeting_title)
+        });
+        let candidate = context.unwrap_or(CandidateApp::BrowserCall);
+        let confidence = if (context.is_some() && (input_active || output_active))
+            || (input_active && output_active)
+        {
+            EvidenceConfidence::High
+        } else if context.is_some() || input_active || output_active {
+            EvidenceConfidence::Possible
+        } else {
+            EvidenceConfidence::None
+        };
+        return (confidence != EvidenceConfidence::None).then_some(CandidateEvidence {
+            candidate,
+            confidence,
+            meeting_context: context.is_some(),
+            input_active,
+            output_active,
+        });
+    }
+
+    let candidate = application
+        .meeting_context
+        .or_else(|| candidate_from_native_identity(&process_name, &bundle, &executable))?;
+    let has_context = application.meeting_context.is_some()
+        || application
+            .window_title
+            .as_deref()
+            .and_then(candidate_from_meeting_title)
+            .is_some();
+    let confidence = if application.is_active_call_helper
+        || has_context
+        || input_active
+        || output_active
+    {
+        EvidenceConfidence::High
+    } else {
+        EvidenceConfidence::None
+    };
+    (confidence != EvidenceConfidence::None).then_some(CandidateEvidence {
+        candidate,
+        confidence,
+        meeting_context: has_context,
+        input_active,
+        output_active,
+    })
+}
+
 fn classify_application(application: &ObservedApplication) -> Option<CandidateApp> {
     let process_name = normalized(&application.process_name);
     let bundle = normalized(application.bundle_identifier.as_deref().unwrap_or_default());
     let executable = normalized(application.executable_path.as_deref().unwrap_or_default());
 
     if is_supported_browser(&process_name, &bundle) {
-        return application
+        return application.meeting_context.or_else(|| application
             .window_title
             .as_deref()
-            .and_then(candidate_from_meeting_title);
+            .and_then(candidate_from_meeting_title));
     }
 
     candidate_from_native_identity(&process_name, &bundle, &executable)
@@ -304,6 +418,7 @@ mod tests {
         ObservedApplication {
             process_name: process_name.to_string(),
             window_title: Some(title.to_string()),
+            is_audio_output_active: true,
             ..ObservedApplication::default()
         }
     }
@@ -382,6 +497,35 @@ mod tests {
             classify_active_candidate(&[browser("Safari", "Inbox - Gmail")]),
             None
         );
+    }
+
+    #[test]
+    fn browser_title_without_audio_is_possible_but_does_not_start() {
+        let observation = ObservedApplication {
+            process_name: "Safari".to_string(),
+            meeting_context: Some(CandidateApp::GoogleMeet),
+            ..ObservedApplication::default()
+        };
+        let evidence = classify_meeting_evidence(&[observation]).expect("possible evidence");
+        assert_eq!(evidence.confidence, EvidenceConfidence::Possible);
+        assert_eq!(classify_active_candidate(&[browser("Safari", "Inbox")]), None);
+    }
+
+    #[test]
+    fn browser_output_only_without_context_is_possible_not_high() {
+        let observation = ObservedApplication {
+            process_name: "Google Chrome".to_string(),
+            is_audio_output_active: true,
+            ..ObservedApplication::default()
+        };
+        let evidence = classify_meeting_evidence(&[observation]).expect("possible evidence");
+        assert_eq!(evidence.candidate, CandidateApp::BrowserCall);
+        assert_eq!(evidence.confidence, EvidenceConfidence::Possible);
+        assert_eq!(classify_active_candidate(&[ObservedApplication {
+            process_name: "Google Chrome".to_string(),
+            is_audio_output_active: true,
+            ..ObservedApplication::default()
+        }]), None);
     }
 
     #[test]

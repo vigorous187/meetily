@@ -1,7 +1,7 @@
 {
     "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
     "productName": "Meetily Plus",
-    "version": "0.4.3",
+    "version": "0.4.4",
     "identifier": "com.meetily.ai",
     "build": {
         "frontendDist": "../out",
@@ -50,7 +50,8 @@
                         "notification:allow-is-permission-granted",
                         "global-shortcut:allow-register",
                         "global-shortcut:allow-unregister",
-                        "global-shortcut:allow-is-registered"
+                        "global-shortcut:allow-is-registered",
+                        "autostart:default"
                     ]
                 }
             ]

@@ -306,6 +306,21 @@ pub fn run() {
 
             tray::focus_main_window(app);
         }));
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--background"]),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(
+            tauri_plugin_log::Builder::new()
+                .max_file_size(5 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(7))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseUtc)
+                .build(),
+        );
     }
 
     builder
@@ -321,6 +336,20 @@ pub fn run() {
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
         .setup(|_app| {
             log::info!("Application setup complete");
+
+            if let Ok(app_data_dir) = _app.handle().path().app_data_dir() {
+                if let Err(error) = meeting_detection::diagnostics::initialize(&app_data_dir) {
+                    log::warn!("Automatic capture diagnostics unavailable: {}", error);
+                }
+            }
+
+            if meeting_detection::autostart::launched_in_background() {
+                if let Some(window) = _app.get_webview_window("main") {
+                    if let Err(error) = window.hide() {
+                        log::warn!("Unable to hide background launch window: {}", error);
+                    }
+                }
+            }
 
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
@@ -461,6 +490,11 @@ pub fn run() {
             meeting_detection::runtime::get_auto_capture_health,
             meeting_detection::runtime::set_auto_capture_enabled,
             meeting_detection::runtime::notify_auto_capture_readiness_changed,
+            meeting_detection::permissions::get_auto_capture_permissions,
+            meeting_detection::permissions::request_auto_capture_permission,
+            meeting_detection::autostart::get_launch_at_login_status,
+            meeting_detection::autostart::set_launch_at_login,
+            meeting_detection::diagnostics::export_auto_capture_diagnostics,
             read_audio_file,
             export::export_meeting_markdown,
             analytics::commands::init_analytics,

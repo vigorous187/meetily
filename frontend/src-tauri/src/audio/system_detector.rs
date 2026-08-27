@@ -4,6 +4,17 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use cidre::{core_audio as ca, os};
 
+/// Privacy-bounded CoreAudio process activity used for local meeting evidence.
+/// No audio samples, window titles, command lines, or URLs are collected.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AudioProcessActivity {
+    pub pid: i32,
+    pub process_name: String,
+    pub bundle_identifier: Option<String>,
+    pub input_active: bool,
+    pub output_active: bool,
+}
+
 /// Event types for system audio detection
 #[derive(Debug, Clone)]
 pub enum SystemAudioEvent {
@@ -356,26 +367,50 @@ impl MacOSSystemAudioDetector {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn list_system_audio_using_apps() -> Vec<String> {
-    match ca::System::processes() {
-        Ok(processes) => {
-            let mut apps = Vec::new();
-            for process in processes {
-                if process.is_running_output().unwrap_or(false) {
-                    if let Ok(pid) = process.pid() {
-                        if let Some(running_app) = cidre::ns::RunningApp::with_pid(pid) {
-                            let name = running_app
-                                .localized_name()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| format!("Process {}", pid));
-                            apps.push(name);
-                        }
-                    }
-                }
-            }
-            apps
-        }
-        Err(_) => Vec::new(),
-    }
+    list_audio_process_activity()
+        .into_iter()
+        .filter(|activity| activity.output_active)
+        .map(|activity| activity.process_name)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn list_audio_process_activity() -> Vec<AudioProcessActivity> {
+    let Ok(processes) = ca::System::processes() else {
+        return Vec::new();
+    };
+
+    processes
+        .into_iter()
+        .filter_map(|process| {
+            let pid = process.pid().ok()?;
+            let running_app = cidre::ns::RunningApp::with_pid(pid);
+            let process_name = running_app
+                .as_ref()
+                .and_then(|app| app.localized_name())
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| format!("Process {pid}"));
+            let bundle_identifier = process
+                .bundle_id()
+                .ok()
+                .map(|bundle| bundle.to_string())
+                .filter(|bundle| !bundle.is_empty())
+                .or_else(|| {
+                    running_app
+                        .as_ref()
+                        .and_then(|app| app.bundle_id())
+                        .map(|bundle| bundle.to_string())
+                });
+            Some(AudioProcessActivity {
+                pid,
+                process_name,
+                bundle_identifier,
+                input_active: process.is_running_input().unwrap_or(false),
+                output_active: process.is_running_output().unwrap_or(false),
+            })
+        })
+        .filter(|activity| activity.input_active || activity.output_active)
+        .collect()
 }
 
 // Stub implementation for non-macOS platforms

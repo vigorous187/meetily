@@ -1,6 +1,6 @@
 [package]
 name = "meetily"
-version = "0.4.3"
+version = "0.4.4"
 description = "A Tauri App for meeting minutes"
 authors = ["Sujith S"]
 license = "MIT"
@@ -152,6 +152,7 @@ tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy
 # Desktop-only single instance guard
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "=2.4.3"
+tauri-plugin-autostart = "2.5.1"
 
 # macOS-specific dependencies with Metal GPU acceleration
 [target.'cfg(target_os = "macos")'.dependencies]
