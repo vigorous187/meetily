@@ -356,10 +356,6 @@ pub fn run() {
                 log::error!("Failed to create system tray: {}", e);
             }
 
-            // The automatic-capture worker is backend-owned. Starting it here
-            // keeps detection alive across window hides, navigation and reloads.
-            meeting_detection::runtime::initialize_auto_capture(_app.handle().clone());
-
             // Initialize notification system with proper defaults
             log::info!("Initializing notification system...");
             let app_for_notif = _app.handle().clone();
@@ -433,6 +429,11 @@ pub fn run() {
                 database::setup::initialize_database_on_startup(&_app.handle()).await
             })
             .expect("Failed to initialize database");
+
+            // The automatic-capture worker is backend-owned. Start it only
+            // after AppState is managed so an immediate meeting cannot race
+            // recording startup against database initialization.
+            meeting_detection::runtime::initialize_auto_capture(_app.handle().clone());
 
             // Repair or populate the private semantic index for existing
             // meetings without delaying the main window. This is local-only;
