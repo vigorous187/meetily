@@ -218,16 +218,16 @@ verify_signed_bundle() {
   fi
 
   local main_entitlements
-  main_entitlements="$(/usr/bin/codesign -d --entitlements :- "$bundle" 2>/dev/null)"
-  [[ "$main_entitlements" == *'<key>com.apple.security.device.audio-input</key>'* ]] || {
+  main_entitlements="$(/usr/bin/codesign -d --entitlements - "$bundle" 2>/dev/null)"
+  [[ "$main_entitlements" == *'com.apple.security.device.audio-input'* ]] || {
     echo "Main executable is missing audio-input entitlement" >&2
     return 1
   }
-  [[ "$main_entitlements" == *'<key>com.apple.security.automation.apple-events</key>'* ]] || {
+  [[ "$main_entitlements" == *'com.apple.security.automation.apple-events'* ]] || {
     echo "Main executable is missing Apple Events Automation entitlement" >&2
     return 1
   }
-  [[ "$(printf '%s' "$main_entitlements" | /usr/bin/grep -c '<key>')" == "2" ]] || {
+  [[ "$(printf '%s\n' "$main_entitlements" | /usr/bin/grep -Ec '(<key>|\[Key\])')" == "2" ]] || {
     echo "Main executable contains unexpected entitlements" >&2
     return 1
   }
@@ -236,8 +236,8 @@ verify_signed_bundle() {
   for sidecar in "${sidecars[@]}"; do
     sidecar_path="$bundle/Contents/MacOS/$sidecar"
     /usr/bin/codesign --verify --strict --verbose=4 "$sidecar_path"
-    sidecar_entitlements="$(/usr/bin/codesign -d --entitlements :- "$sidecar_path" 2>/dev/null || true)"
-    [[ "$sidecar_entitlements" != *'<key>'* ]] || {
+    sidecar_entitlements="$(/usr/bin/codesign -d --entitlements - "$sidecar_path" 2>/dev/null || true)"
+    [[ "$sidecar_entitlements" != *'<key>'* && "$sidecar_entitlements" != *'[Key]'* ]] || {
       echo "Sidecar unexpectedly has entitlements: $sidecar" >&2
       return 1
     }

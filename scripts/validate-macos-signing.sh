@@ -28,9 +28,18 @@ fi
 
 /usr/bin/codesign --verify --deep --strict --verbose=4 "$artifact"
 if [[ "$artifact" == *.app ]]; then
-  entitlements="$(/usr/bin/codesign -d --entitlements :- "$artifact" 2>/dev/null)"
-  if [[ "$entitlements" != *'<key>com.apple.security.automation.apple-events</key>'* ]]; then
+  entitlements="$(/usr/bin/codesign -d --entitlements - "$artifact" 2>/dev/null)"
+  if [[ "$entitlements" != *'com.apple.security.device.audio-input'* ]]; then
+    echo "Installed internal builds require the audio-input entitlement" >&2
+    exit 3
+  fi
+  if [[ "$entitlements" != *'com.apple.security.automation.apple-events'* ]]; then
     echo "Installed internal builds require the Apple Events Automation entitlement" >&2
+    exit 3
+  fi
+  entitlement_key_count="$(printf '%s\n' "$entitlements" | /usr/bin/grep -Ec '(<key>|\[Key\])')"
+  if [[ "$entitlement_key_count" != "2" ]]; then
+    echo "Installed internal builds contain unexpected entitlements" >&2
     exit 3
   fi
 fi
