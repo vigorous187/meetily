@@ -35,6 +35,9 @@ describe('Automatic Capture Health presentation', () => {
     expect(getAutoCaptureHealthView(health({ degradedReasons: ['system_audio_unavailable'] })).tone).toBe('warning')
     expect(getAutoCaptureHealthView(health({ state: 'failed', detectorRunning: false })).tone).toBe('error')
     expect(getAutoCaptureHealthView(health({ enabled: false, state: 'disabled' })).tone).toBe('inactive')
+    const denied = getAutoCaptureHealthView(health({ permissions: [{ kind: 'screenRecording', status: 'denied', message: 'Denied' }] }))
+    expect(denied.tone).toBe('warning')
+    expect(denied.title).toBe('Action required')
   })
 
   test('uses user-safe permission labels', () => {

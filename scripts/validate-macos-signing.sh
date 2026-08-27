@@ -27,4 +27,11 @@ if [[ "$details" != *"Authority=Apple Development:"* && "$details" != *"Authorit
 fi
 
 /usr/bin/codesign --verify --deep --strict --verbose=4 "$artifact"
+if [[ "$artifact" == *.app ]]; then
+  entitlements="$(/usr/bin/codesign -d --entitlements :- "$artifact" 2>/dev/null)"
+  if [[ "$entitlements" != *'<key>com.apple.security.automation.apple-events</key>'* ]]; then
+    echo "Installed internal builds require the Apple Events Automation entitlement" >&2
+    exit 3
+  fi
+fi
 echo "Verified stable Apple signature (TeamIdentifier=$team_identifier): $artifact"

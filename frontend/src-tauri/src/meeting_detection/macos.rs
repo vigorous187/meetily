@@ -5,7 +5,6 @@
 //! small integration interfaces rather than inspected through private APIs.
 
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::ffi::{c_char, c_void, CStr};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +15,9 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use super::permissions::{PermissionKind, PermissionState, PermissionStatus};
 use super::signals::{
-    candidate_from_meeting_title, candidate_from_process_name, is_active_call_helper,
-    is_supported_browser, CandidateApp, ObservedApplication, SignalProvider, SignalSnapshot,
+    candidate_from_meeting_title, candidate_from_process_name, classify_meeting_evidence,
+    is_active_call_helper, is_supported_browser, CandidateApp, CandidateEvidence,
+    ObservedApplication, SignalProvider, SignalSnapshot,
 };
 
 #[derive(Clone, Default)]
@@ -50,14 +50,14 @@ impl RuntimeActivityFlags {
 /// observations using an already-authorized window API without changing the
 /// detector policy or process scanner.
 pub trait WindowContextSource: Send {
-    fn observed_windows(&mut self) -> Vec<ObservedApplication>;
+    fn observed_windows(&mut self) -> Result<Vec<ObservedApplication>, &'static str>;
 }
 
 pub struct NoWindowContextSource;
 
 impl WindowContextSource for NoWindowContextSource {
-    fn observed_windows(&mut self) -> Vec<ObservedApplication> {
-        Vec::new()
+    fn observed_windows(&mut self) -> Result<Vec<ObservedApplication>, &'static str> {
+        Ok(Vec::new())
     }
 }
 
@@ -74,10 +74,10 @@ impl MacOsWindowContextSource {
 }
 
 impl WindowContextSource for MacOsWindowContextSource {
-    fn observed_windows(&mut self) -> Vec<ObservedApplication> {
-        let mut observations = meeting_windows();
+    fn observed_windows(&mut self) -> Result<Vec<ObservedApplication>, &'static str> {
+        let mut observations = meeting_windows()?;
         observations.extend(browser_meeting_contexts());
-        observations
+        Ok(observations)
     }
 }
 
@@ -141,9 +141,9 @@ fn supported_window_owner(owner_name: &str) -> bool {
         || candidate_from_process_name(owner_name).is_some()
 }
 
-fn meeting_windows() -> Vec<ObservedApplication> {
+fn meeting_windows() -> Result<Vec<ObservedApplication>, &'static str> {
     if !super::permissions::screen_recording_granted() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // 0 requests all eligible windows, including minimized/background windows
@@ -154,12 +154,12 @@ fn meeting_windows() -> Vec<ObservedApplication> {
     let window_array =
         unsafe { CGWindowListCopyWindowInfo(ALL_WINDOWS | EXCLUDE_DESKTOP_ELEMENTS, 0) };
     let Some(window_array) = OwnedCf::new(window_array) else {
-        return Vec::new();
+        return Err("window_enumeration_failed");
     };
 
     let count = unsafe { CFArrayGetCount(window_array.as_ptr()) };
     if count <= 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut observations = Vec::new();
@@ -190,7 +190,7 @@ fn meeting_windows() -> Vec<ObservedApplication> {
         }
     }
 
-    observations
+    Ok(observations)
 }
 
 #[derive(Clone, Copy)]
@@ -232,6 +232,10 @@ pub(crate) fn browser_automation_permission_state() -> PermissionState {
 pub(crate) fn probe_browser_automation() -> Vec<ObservedApplication> {
     AUTOMATION_PROBE_ALLOWED.store(true, Ordering::Release);
     browser_meeting_contexts()
+}
+
+pub(crate) fn set_browser_automation_allowed(allowed: bool) {
+    AUTOMATION_PROBE_ALLOWED.store(allowed, Ordering::Release);
 }
 
 fn browser_meeting_contexts() -> Vec<ObservedApplication> {
@@ -333,8 +337,9 @@ end repeat
 end tell
 repeat with tabUrl in tabUrls
 if tabUrl contains "//meet.google.com/" then return "googleMeet"
-if tabUrl contains "//zoom.us/" then return "zoom"
+if tabUrl contains "//zoom.us/" or tabUrl contains ".zoom.us/" then return "zoom"
 if tabUrl contains "//teams.microsoft.com/" then return "microsoftTeams"
+if tabUrl contains "//teams.live.com/" then return "microsoftTeams"
 if tabUrl contains ".webex.com/" then return "ciscoWebex"
 if tabUrl contains "//meet.jit.si/" then return "jitsiMeet"
 if tabUrl contains "//whereby.com/" then return "whereby"
@@ -489,6 +494,7 @@ pub struct MacOsSignalProvider<W = NoWindowContextSource> {
     last_audio_refresh: Option<Instant>,
     cached_context: Vec<ObservedApplication>,
     cached_audio: Vec<crate::audio::system_detector::AudioProcessActivity>,
+    last_evidence: Option<CandidateEvidence>,
 }
 
 const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -511,6 +517,7 @@ impl<W: WindowContextSource> MacOsSignalProvider<W> {
             last_audio_refresh: None,
             cached_context: Vec::new(),
             cached_audio: Vec::new(),
+            last_evidence: None,
         }
     }
 
@@ -520,7 +527,7 @@ impl<W: WindowContextSource> MacOsSignalProvider<W> {
 }
 
 impl<W: WindowContextSource> SignalProvider for MacOsSignalProvider<W> {
-    type Error = Infallible;
+    type Error = &'static str;
 
     fn sample(&mut self) -> Result<SignalSnapshot, Self::Error> {
         let now = Instant::now();
@@ -556,7 +563,7 @@ impl<W: WindowContextSource> SignalProvider for MacOsSignalProvider<W> {
                     }
                 })
                 .collect();
-            applications.extend(self.window_context.observed_windows());
+            applications.extend(self.window_context.observed_windows()?);
             self.cached_context = applications;
             self.last_context_refresh = Some(now);
         }
@@ -564,13 +571,33 @@ impl<W: WindowContextSource> SignalProvider for MacOsSignalProvider<W> {
         if self.last_audio_refresh.map_or(true, |last| {
             now.duration_since(last) >= AUDIO_REFRESH_INTERVAL
         }) {
-            self.cached_audio = crate::audio::system_detector::list_audio_process_activity();
+            self.cached_audio =
+                crate::audio::system_detector::try_list_audio_process_activity()?;
             self.last_audio_refresh = Some(now);
+        }
+
+        let applications = correlate_audio(&self.cached_context, &self.cached_audio);
+        let evidence = classify_meeting_evidence(&applications);
+        if evidence != self.last_evidence {
+            if let Some(value) = evidence {
+                super::diagnostics::record(
+                    super::diagnostics::JournalEntry::new(
+                        super::diagnostics::JournalEvent::EvidenceObserved,
+                    )
+                    .candidate(value.candidate)
+                    .evidence(
+                        value.meeting_context,
+                        value.input_active,
+                        value.output_active,
+                    ),
+                );
+            }
+            self.last_evidence = evidence;
         }
 
         Ok(SignalSnapshot {
             observed_at: self.started_at.elapsed(),
-            applications: correlate_audio(&self.cached_context, &self.cached_audio),
+            applications,
             recording_active: self.flags.recording_active(),
             dictation_active: self.flags.dictation_active(),
         })
@@ -627,6 +654,19 @@ fn host_audio_identity(process_name: &str, bundle: Option<&str>) -> (String, Opt
     let bundle_lower = bundle.unwrap_or_default().to_lowercase();
     let mapped = if bundle_lower.starts_with("com.google.chrome") || name.contains("chrome helper") {
         Some(("Google Chrome", "com.google.Chrome"))
+    } else if bundle_lower.starts_with("com.apple.safari")
+        || bundle_lower.starts_with("com.apple.webkit")
+        || name.contains("safari web content")
+        || name.contains("webkit webcontent")
+    {
+        Some(("Safari", "com.apple.Safari"))
+    } else if bundle_lower.starts_with("org.mozilla.firefox")
+        || name.contains("firefoxcp web content")
+        || name.contains("firefox web content")
+    {
+        Some(("Firefox", "org.mozilla.firefox"))
+    } else if bundle_lower.starts_with("com.kagi.kagimac") || name.contains("orion web content") {
+        Some(("Orion", "com.kagi.kagimac"))
     } else if bundle_lower.starts_with("com.microsoft.edgemac") || name.contains("edge helper") {
         Some(("Microsoft Edge", "com.microsoft.edgemac"))
     } else if bundle_lower.starts_with("com.brave.browser") || name.contains("brave browser helper") {
@@ -725,6 +765,8 @@ mod tests {
         assert_eq!(candidate_from_automation_token("https://meet.google.com/secret"), None);
         let script = browser_classification_script("Safari");
         assert!(script.contains("return \"googleMeet\""));
+        assert!(script.contains(".zoom.us/"));
+        assert!(script.contains("//teams.live.com/"));
         assert!(!script.contains("return tabUrl"));
     }
 
@@ -737,6 +779,14 @@ mod tests {
         assert_eq!(
             host_audio_identity("Slack Helper", Some("com.tinyspeck.slackmacgap.helper")),
             ("Slack".to_string(), Some("com.tinyspeck.slackmacgap".to_string()))
+        );
+        assert_eq!(
+            host_audio_identity("Safari Web Content", Some("com.apple.WebKit.WebContent")),
+            ("Safari".to_string(), Some("com.apple.Safari".to_string()))
+        );
+        assert_eq!(
+            host_audio_identity("FirefoxCP Web Content", Some("org.mozilla.firefox.helper")),
+            ("Firefox".to_string(), Some("org.mozilla.firefox".to_string()))
         );
     }
 
@@ -786,7 +836,7 @@ mod tests {
     #[ignore = "requires an interactive macOS window server session"]
     fn system_window_source_returns_only_filtered_meeting_context() {
         let mut source = MacOsWindowContextSource::new();
-        for observation in source.observed_windows() {
+        for observation in source.observed_windows().expect("window query") {
             assert!(supported_window_owner(&observation.process_name));
             assert!(observation.meeting_context.is_some());
         }

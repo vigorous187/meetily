@@ -1,4 +1,8 @@
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_store::StoreExt;
+
+pub(crate) const BROWSER_AUTOMATION_REQUESTED: &str = "browser_automation_requested";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,7 +95,7 @@ pub fn permission_state(kind: PermissionKind) -> PermissionState {
             kind,
             PermissionStatus::NotDetermined,
             Some("audio_capture_permission_unverifiable"),
-            "macOS does not expose a reliable Audio Capture preflight. Meetily verifies non-silent system audio after recording starts.",
+            "macOS does not expose a reliable Audio Capture preflight. Meetily can request access, then reports actual stream availability after recording starts.",
         ),
     }
 }
@@ -109,8 +113,11 @@ pub fn get_auto_capture_permissions() -> Vec<PermissionState> {
 }
 
 #[tauri::command]
-pub async fn request_auto_capture_permission(kind: PermissionKind) -> PermissionState {
-    match kind {
+pub async fn request_auto_capture_permission<R: Runtime>(
+    app: AppHandle<R>,
+    kind: PermissionKind,
+) -> PermissionState {
+    let state = match kind {
         PermissionKind::ScreenRecording => {
             #[cfg(target_os = "macos")]
             {
@@ -143,6 +150,10 @@ pub async fn request_auto_capture_permission(kind: PermissionKind) -> Permission
         PermissionKind::BrowserAutomation => {
             #[cfg(target_os = "macos")]
             {
+                if let Ok(store) = app.store("preferences.json") {
+                    store.set(BROWSER_AUTOMATION_REQUESTED, serde_json::Value::Bool(true));
+                    let _ = store.save();
+                }
                 let _ = tokio::task::spawn_blocking(super::macos::probe_browser_automation).await;
             }
             permission_state(kind)
@@ -152,7 +163,21 @@ pub async fn request_auto_capture_permission(kind: PermissionKind) -> Permission
                 .await;
             permission_state(kind)
         }
+    };
+    super::diagnostics::record(
+        super::diagnostics::JournalEntry::new(super::diagnostics::JournalEvent::PermissionChanged)
+            .state(match state.status {
+                PermissionStatus::Granted => "granted",
+                PermissionStatus::Denied => "denied",
+                PermissionStatus::NotDetermined => "not_determined",
+                PermissionStatus::Unavailable => "unavailable",
+            })
+            .success(state.status == PermissionStatus::Granted),
+    );
+    if state.status == PermissionStatus::Granted || kind == PermissionKind::AudioCapture {
+        let _ = super::runtime::notify_auto_capture_readiness_changed(app);
     }
+    state
 }
 
 #[cfg(target_os = "macos")]

@@ -127,8 +127,14 @@ if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-inpu
   echo "The main executable must retain the audio-input entitlement" >&2
   exit 3
 fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.automation.apple-events' "$tauri_dir/entitlements.plist")" != "true" ]]; then
+  echo "The main executable must retain the Apple Events Automation entitlement" >&2
+  exit 3
+fi
 entitlement_keys="$(/usr/bin/plutil -p "$tauri_dir/entitlements.plist" | /usr/bin/sed -n 's/^  "\([^"]*\)" =>.*/\1/p')"
-if [[ "$entitlement_keys" != "com.apple.security.device.audio-input" ]]; then
+if [[ "$(printf '%s\n' "$entitlement_keys" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" != "2" ]] \
+  || [[ "$entitlement_keys" != *"com.apple.security.device.audio-input"* ]] \
+  || [[ "$entitlement_keys" != *"com.apple.security.automation.apple-events"* ]]; then
   echo "Unexpected main-executable entitlement: $entitlement_keys" >&2
   exit 3
 fi
@@ -217,7 +223,11 @@ verify_signed_bundle() {
     echo "Main executable is missing audio-input entitlement" >&2
     return 1
   }
-  [[ "$(printf '%s' "$main_entitlements" | /usr/bin/grep -c '<key>')" == "1" ]] || {
+  [[ "$main_entitlements" == *'<key>com.apple.security.automation.apple-events</key>'* ]] || {
+    echo "Main executable is missing Apple Events Automation entitlement" >&2
+    return 1
+  }
+  [[ "$(printf '%s' "$main_entitlements" | /usr/bin/grep -c '<key>')" == "2" ]] || {
     echo "Main executable contains unexpected entitlements" >&2
     return 1
   }

@@ -37,6 +37,7 @@ pub use super::transcription::TranscriptUpdate;
 
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+static TRANSCRIPTION_DEGRADED: AtomicBool = AtomicBool::new(false);
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
@@ -93,22 +94,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
-    // Validate that transcription models are available before starting recording
+    // Rust owns provider-aware readiness. Missing transcription is degradable
+    // when audio saving is enabled, but never when it would leave no output.
     info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
-            "actionable": false
-        }));
-
-        return Err(validation_error);
-    }
-    info!("✅ Transcription model validation passed");
+    let transcription_error =
+        transcription::validate_transcription_model_ready(&app).await.err();
 
     // Async-first approach - no more blocking operations!
     info!("🚀 Starting async recording initialization");
@@ -129,6 +119,26 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                 (true, None, None)
             }
         };
+
+    let transcription_enabled = transcription_error.is_none();
+    if let Some(validation_error) = transcription_error.as_ref() {
+        if !auto_save {
+            return Err(format!(
+                "no_output_available: Transcription is unavailable and audio saving is disabled: {validation_error}"
+            ));
+        }
+        warn!(
+            "Transcription unavailable; continuing with saved audio only: {}",
+            validation_error
+        );
+        let _ = app.emit("transcription-warning", serde_json::json!({
+            "errorCode": "transcription_unavailable",
+            "userMessage": "Recording started in audio-only mode. The saved audio can be transcribed later."
+        }));
+    } else {
+        info!("✅ Transcription model validation passed");
+    }
+    TRANSCRIPTION_DEGRADED.store(!transcription_enabled, Ordering::SeqCst);
 
     // ============================================================================
     // MICROPHONE DEVICE RESOLUTION: Preference → Default → Error
@@ -238,7 +248,12 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
-        .start_recording(microphone_device, system_device, auto_save)
+        .start_recording(
+            microphone_device,
+            system_device,
+            auto_save,
+            transcription_enabled,
+        )
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -255,8 +270,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
+    if let Some(transcription_receiver) = transcription_receiver {
+        let task_handle =
+            transcription::start_transcription_task(app.clone(), transcription_receiver);
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
     }
@@ -338,22 +354,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
-    // Validate that transcription models are available before starting recording
+    // Validate the selected provider in Rust. Audio-only degradation is
+    // decided after the audio-saving preference is loaded below.
     info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
-            "actionable": false
-        }));
-
-        return Err(validation_error);
-    }
-    info!("✅ Transcription model validation passed");
+    let transcription_error =
+        transcription::validate_transcription_model_ready(&app).await.err();
 
     // Parse devices
     let mic_device = if let Some(ref name) = mic_device_name {
@@ -361,7 +366,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             format!("Invalid microphone device '{}': {}", name, e)
         })?))
     } else {
-        None
+        Some(Arc::new(default_input_device().map_err(|error| {
+            format!("No microphone device available: {error}")
+        })?))
     };
 
     let system_device = if let Some(ref name) = system_device_name {
@@ -369,7 +376,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             format!("Invalid system device '{}': {}", name, e)
         })?))
     } else {
-        None
+        default_output_device().ok().map(Arc::new)
     };
 
     // Async-first approach for custom devices - no more blocking operations!
@@ -390,6 +397,26 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         }
     };
 
+    let transcription_enabled = transcription_error.is_none();
+    if let Some(validation_error) = transcription_error.as_ref() {
+        if !auto_save {
+            return Err(format!(
+                "no_output_available: Transcription is unavailable and audio saving is disabled: {validation_error}"
+            ));
+        }
+        warn!(
+            "Transcription unavailable; continuing with saved audio only: {}",
+            validation_error
+        );
+        let _ = app.emit("transcription-warning", serde_json::json!({
+            "errorCode": "transcription_unavailable",
+            "userMessage": "Recording started in audio-only mode. The saved audio can be transcribed later."
+        }));
+    } else {
+        info!("✅ Transcription model validation passed");
+    }
+    TRANSCRIPTION_DEGRADED.store(!transcription_enabled, Ordering::SeqCst);
+
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         let now = chrono::Local::now();
@@ -408,7 +435,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Start recording with specified devices and auto_save setting
     let transcription_receiver = manager
-        .start_recording(mic_device, system_device, auto_save)
+        .start_recording(
+            mic_device,
+            system_device,
+            auto_save,
+            transcription_enabled,
+        )
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -425,8 +457,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
+    if let Some(transcription_receiver) = transcription_receiver {
+        let task_handle =
+            transcription::start_transcription_task(app.clone(), transcription_receiver);
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
     }
@@ -808,6 +841,7 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Perform final cleanup with the manager if available
+    let mut save_error: Option<String> = None;
     let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
@@ -825,15 +859,12 @@ pub async fn stop_recording<R: Runtime>(
                 info!("✅ Recording data saved successfully during cleanup");
             }
             Ok(Err(e)) => {
-                warn!(
-                    "⚠️ Error during recording cleanup (transcripts preserved): {}",
-                    e
-                );
-                // Don't fail shutdown - transcripts are already preserved
+                error!("Recording save failed after capture cleanup: {}", e);
+                save_error = Some(format!("recording_save_failed: {e}"));
             }
             Err(_) => {
-                warn!("⏱️ Local post-processing timeout reached during save, continuing shutdown");
-                // Don't fail shutdown - transcripts are already preserved
+                error!("Local post-processing timed out during save");
+                save_error = Some("recording_save_timeout".to_string());
             }
         }
 
@@ -846,6 +877,7 @@ pub async fn stop_recording<R: Runtime>(
     // Set recording flag to false
     info!("🔍 Setting IS_RECORDING to false");
     IS_RECORDING.store(false, Ordering::SeqCst);
+    TRANSCRIPTION_DEGRADED.store(false, Ordering::SeqCst);
 
     // Step 4.5: Prepare metadata for frontend (NO database save)
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.
@@ -867,8 +899,8 @@ pub async fn stop_recording<R: Runtime>(
     let _ = app.emit(
         "recording-shutdown-progress",
         serde_json::json!({
-            "stage": "complete",
-            "message": "Recording stopped successfully",
+            "stage": if save_error.is_some() { "save_failed" } else { "complete" },
+            "message": if save_error.is_some() { "Recording stopped, but saving failed" } else { "Recording stopped successfully" },
             "progress": 100
         }),
     );
@@ -877,7 +909,9 @@ pub async fn stop_recording<R: Runtime>(
     if let Err(error) = app.emit(
         "recording-stopped",
         serde_json::json!({
-            "message": "Recording stopped - frontend will save after all transcripts received",
+            "message": if save_error.is_some() { "Recording stopped, but the audio save failed" } else { "Recording stopped - frontend will save after all transcripts received" },
+            "save_succeeded": save_error.is_none(),
+            "error_code": save_error.as_ref().map(|_| "recording_save_failed"),
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str
         }),
@@ -889,6 +923,9 @@ pub async fn stop_recording<R: Runtime>(
     // Update tray menu to reflect stopped state
     crate::tray::update_tray_menu(&app);
 
+    if let Some(error) = save_error {
+        return Err(error);
+    }
     info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
     Ok(())
 }
@@ -917,6 +954,16 @@ pub fn current_degraded_reasons() -> Vec<String> {
     let mut reasons = Vec::new();
     if state.get_system_device().is_none() {
         reasons.push("system_audio_unavailable".to_string());
+    } else {
+        let stats = state.get_stats();
+        if state.get_recording_duration().unwrap_or(0.0) >= 5.0
+            && stats.system_non_silent_chunks == 0
+        {
+            reasons.push("system_audio_silent".to_string());
+        }
+    }
+    if TRANSCRIPTION_DEGRADED.load(Ordering::SeqCst) {
+        reasons.push("transcription_unavailable".to_string());
     }
     reasons
 }

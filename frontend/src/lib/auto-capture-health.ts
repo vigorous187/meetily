@@ -34,16 +34,21 @@ export function getAutoCaptureHealthView(
   health: AutoCaptureHealth,
   now = new Date(),
 ): AutoCaptureHealthView {
-  const title = STATE_TITLES[health.state]
+  const permissionNeedsAttention = health.permissions.some((permission) =>
+    permission.kind !== 'audioCapture' && permission.status !== 'granted'
+  )
+  const title = permissionNeedsAttention && health.enabled && health.state === 'observing'
+    ? 'Action required'
+    : STATE_TITLES[health.state]
   const fallbackDetail = health.enabled
     ? 'Meetily is monitoring local meeting signals.'
     : 'Turn on automatic capture to monitor meetings.'
 
   let tone: HealthTone = 'healthy'
   if (!health.enabled || health.state === 'disabled') tone = 'inactive'
-  else if (health.state === 'starting' || health.state === 'stopping' || health.state === 'retryScheduled') tone = 'working'
-  else if (health.state === 'needsAction' || health.degradedReasons.length > 0) tone = 'warning'
   else if (health.state === 'failed' || !health.detectorRunning) tone = 'error'
+  else if (health.state === 'needsAction' || health.degradedReasons.length > 0 || permissionNeedsAttention || !health.launchAtLogin.enabled) tone = 'warning'
+  else if (health.state === 'starting' || health.state === 'stopping' || health.state === 'retryScheduled') tone = 'working'
 
   let retryLabel: string | undefined
   if (health.nextRetryAtMs) {

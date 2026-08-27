@@ -15,9 +15,15 @@ const AUTO_CAPTURE_PREFERENCE: &str = "automatic_meeting_detection_enabled";
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static DISMISS_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SOURCE_FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 static WORKER: LazyLock<Mutex<Option<DetectorWorker>>> = LazyLock::new(|| Mutex::new(None));
 static COORDINATOR: LazyLock<Mutex<AutoCaptureCoordinator>> =
     LazyLock::new(|| Mutex::new(AutoCaptureCoordinator::default()));
+static PROCESS_STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn process_elapsed() -> Duration {
+    PROCESS_STARTED.elapsed()
+}
 
 struct DetectorWorker {
     stop: Arc<AtomicBool>,
@@ -39,9 +45,9 @@ enum RuntimeOutcome {
 /// Start from Tauri setup when the persisted opt-in is enabled. This is
 /// independent of React mounting, navigation, and window visibility.
 pub fn initialize_auto_capture<R: Runtime>(app: AppHandle<R>) {
-    let enabled = app
-        .store("preferences.json")
-        .ok()
+    let store = app.store("preferences.json").ok();
+    let enabled = store
+        .as_ref()
         .and_then(|store| store.get(AUTO_CAPTURE_PREFERENCE))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
@@ -51,6 +57,24 @@ pub fn initialize_auto_capture<R: Runtime>(app: AppHandle<R>) {
     if let Ok(mut coordinator) = COORDINATOR.lock() {
         coordinator.set_enabled(true);
     }
+    // Migrate existing opt-in users exactly once. A later explicit disable of
+    // the separate launch toggle is persisted and respected on every launch.
+    let launch_choice_exists = store
+        .as_ref()
+        .and_then(|store| store.get(super::autostart::LAUNCH_AT_LOGIN_CONFIGURED))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !launch_choice_exists {
+        let _ = super::autostart::set_launch_at_login(app.clone(), true);
+    }
+    #[cfg(target_os = "macos")]
+    super::macos::set_browser_automation_allowed(
+        store
+            .as_ref()
+            .and_then(|store| store.get(super::permissions::BROWSER_AUTOMATION_REQUESTED))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    );
     if let Err(error) = start_detector_worker(app.clone()) {
         mark_worker_stopped(&app, Some(error));
     }
@@ -231,6 +255,20 @@ fn run_macos_detector_supervised<R: Runtime>(app: AppHandle<R>, stop: Arc<Atomic
             JournalEntry::new(JournalEvent::WorkerRestarted)
                 .error_code("detector_worker_panicked"),
         );
+        if !SOURCE_FAILURE_NOTIFIED.load(Ordering::Acquire) {
+            use tauri_plugin_notification::NotificationExt;
+            if let Ok(mut coordinator) = COORDINATOR.lock() {
+                coordinator.signal_source_failed("detector_worker_panicked");
+            }
+            SOURCE_FAILURE_NOTIFIED.store(true, Ordering::Release);
+            emit_status(&app);
+            let _ = app
+                .notification()
+                .builder()
+                .title("Automatic capture restarted")
+                .body("The meeting detector stopped unexpectedly and is restarting.")
+                .show();
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
     RUNNING.store(false, Ordering::Release);
@@ -246,14 +284,54 @@ fn run_macos_detector<R: Runtime>(app: AppHandle<R>, stop: Arc<AtomicBool>) {
     let provider =
         MacOsSignalProvider::with_window_context(flags.clone(), MacOsWindowContextSource::new());
     let mut detector = LocalMeetingDetector::new(provider, Default::default());
-    let started_at = Instant::now();
+    if let Some(candidate) = COORDINATOR
+        .lock()
+        .ok()
+        .and_then(|coordinator| coordinator.recovery_candidate())
+    {
+        detector.restore_active(candidate);
+    }
     let (outcome_tx, outcome_rx) = mpsc::channel();
 
     while RUNNING.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
-        drain_outcomes(&app, &outcome_tx, &outcome_rx, started_at.elapsed());
+        drain_outcomes(&app, &outcome_tx, &outcome_rx, process_elapsed());
+
+        if !matches!(
+            detector.state(),
+            super::MeetingDetectorState::Active { .. }
+                | super::MeetingDetectorState::Ending { .. }
+        ) {
+            if let Some(candidate) = COORDINATOR
+                .lock()
+                .ok()
+                .and_then(|coordinator| coordinator.recovery_candidate())
+            {
+                detector.restore_active(candidate);
+            }
+        }
 
         let recording_active = crate::audio::recording_commands::is_recording_active();
         let dictation_active = crate::dictation::is_active();
+        let degraded_reasons = crate::audio::recording_commands::current_degraded_reasons();
+        let remote_audio_missing = degraded_reasons.iter().any(|reason| {
+            reason == "system_audio_unavailable" || reason == "system_audio_silent"
+        });
+        let audio_health_changed = if recording_active {
+            COORDINATOR.lock().ok().is_some_and(|mut coordinator| {
+                coordinator.update_degraded_reasons(degraded_reasons)
+            })
+        } else {
+            false
+        };
+        if audio_health_changed && remote_audio_missing {
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app
+                .notification()
+                .builder()
+                .title("Recording with microphone only")
+                .body("System audio is unavailable or silent, so remote voices may be missing.")
+                .show();
+        }
         flags.set_recording_active(recording_active);
         flags.set_dictation_active(dictation_active);
         if DISMISS_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -261,8 +339,36 @@ fn run_macos_detector<R: Runtime>(app: AppHandle<R>, stop: Arc<AtomicBool>) {
         }
 
         let event = match detector.poll() {
-            Ok(event) => event,
-            Err(error) => match error {},
+            Ok(event) => {
+                if SOURCE_FAILURE_NOTIFIED.swap(false, Ordering::AcqRel) {
+                    if let Ok(mut coordinator) = COORDINATOR.lock() {
+                        coordinator.signal_source_recovered();
+                    }
+                    emit_status(&app);
+                }
+                event
+            }
+            Err(error_code) => {
+                use tauri_plugin_notification::NotificationExt;
+                super::diagnostics::record(
+                    super::diagnostics::JournalEntry::new(super::diagnostics::JournalEvent::Error)
+                        .error_code(error_code)
+                        .success(false),
+                );
+                if let Ok(mut coordinator) = COORDINATOR.lock() {
+                    coordinator.signal_source_failed(error_code);
+                }
+                emit_status(&app);
+                if !SOURCE_FAILURE_NOTIFIED.swap(true, Ordering::AcqRel) {
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("Automatic capture restarted")
+                        .body("A local meeting-signal source failed. Meetily is restarting detection automatically.")
+                        .show();
+                }
+                panic!("automatic capture signal source failed: {error_code}");
+            }
         };
         let had_event = event.is_some();
         let action = match event {
@@ -276,11 +382,24 @@ fn run_macos_detector<R: Runtime>(app: AppHandle<R>, stop: Arc<AtomicBool>) {
                 .lock()
                 .ok()
                 .and_then(|mut coordinator| coordinator.meeting_ended(candidate)),
+            Some(DetectorEvent::PossibleMeeting { candidate }) => {
+                use tauri_plugin_notification::NotificationExt;
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Possible meeting detected")
+                    .body(format!(
+                        "{} has partial meeting evidence. Recording will start only after stronger local audio evidence.",
+                        candidate.display_name()
+                    ))
+                    .show();
+                None
+            }
             None => COORDINATOR.lock().ok().and_then(|mut coordinator| {
-                coordinator.tick(started_at.elapsed(), recording_active, dictation_active)
+                coordinator.tick(process_elapsed(), recording_active, dictation_active)
             }),
         };
-        if had_event || action.is_some() {
+        if had_event || action.is_some() || audio_health_changed {
             emit_status(&app);
         }
         if let Some(action) = action {
@@ -361,7 +480,7 @@ async fn apply_detached_outcome<R: Runtime>(app: AppHandle<R>, outcome: RuntimeO
             match result {
                 Ok(receipt) => coordinator.start_succeeded(&meeting_session_id, receipt),
                 Err(error) => {
-                    coordinator.start_failed(&meeting_session_id, error, Duration::ZERO);
+                    coordinator.start_failed(&meeting_session_id, error, process_elapsed());
                     None
                 }
             }
@@ -410,7 +529,7 @@ async fn execute_action_inline<R: Runtime>(action: CoordinatorAction, app: AppHa
                         coordinator.start_succeeded(&meeting_session_id, receipt);
                     }
                     Err(error) => {
-                        coordinator.start_failed(&meeting_session_id, error, Duration::ZERO)
+                        coordinator.start_failed(&meeting_session_id, error, process_elapsed())
                     }
                 }
             }
@@ -436,8 +555,16 @@ async fn execute_action<R: Runtime>(
         CoordinatorAction::Start {
             meeting_session_id,
             candidate,
-            ..
+            attempt,
         } => {
+            super::diagnostics::record(
+                super::diagnostics::JournalEntry::new(
+                    super::diagnostics::JournalEvent::RecordingAttempt,
+                )
+                .session_id(&meeting_session_id)
+                .candidate(candidate)
+                .attempt(attempt),
+            );
             let result = crate::recording_session::start_automatic(
                 app.clone(),
                 meeting_session_id.clone(),
@@ -446,6 +573,16 @@ async fn execute_action<R: Runtime>(
             .await
             .map_err(recording_error);
             if let Ok(receipt) = &result {
+                super::diagnostics::record(
+                    super::diagnostics::JournalEntry::new(
+                        super::diagnostics::JournalEvent::RecordingCommitted,
+                    )
+                    .session_id(&meeting_session_id)
+                    .recording_id(&receipt.recording_id)
+                    .candidate(candidate)
+                    .degraded_reasons(&receipt.degraded_reasons)
+                    .success(true),
+                );
                 crate::tray::update_tray_menu(&app);
                 let state = app.state::<
                     crate::notifications::commands::NotificationManagerState<R>,
@@ -461,6 +598,15 @@ async fn execute_action<R: Runtime>(
                     log::warn!("Automatic recording started but notification failed: {error}");
                 }
                 log::info!("Automatic recording acknowledged: {}", receipt.recording_id);
+            } else if let Err(error) = &result {
+                super::diagnostics::record(
+                    super::diagnostics::JournalEntry::new(super::diagnostics::JournalEvent::Error)
+                        .session_id(&meeting_session_id)
+                        .candidate(candidate)
+                        .attempt(attempt)
+                        .error_code(error.code)
+                        .success(false),
+                );
             }
             RuntimeOutcome::Started {
                 meeting_session_id,
@@ -478,6 +624,16 @@ async fn execute_action<R: Runtime>(
             )
             .await
             .map_err(recording_error);
+            let mut save_entry = super::diagnostics::JournalEntry::new(
+                super::diagnostics::JournalEvent::SaveResult,
+            )
+                    .session_id(&meeting_session_id)
+                    .recording_id(&recording_id)
+                    .success(result.is_ok());
+            if let Err(error) = &result {
+                save_entry = save_entry.error_code(error.code);
+            }
+            super::diagnostics::record(save_entry);
             RuntimeOutcome::Stopped {
                 meeting_session_id,
                 recording_id,
@@ -516,6 +672,32 @@ fn emit_status<R: Runtime>(app: &AppHandle<R>) {
     let status: Option<AutoCaptureStatusChanged> =
         COORDINATOR.lock().ok().map(|coordinator| coordinator.status());
     if let Some(status) = status {
+        let state = match status.state {
+            super::AutoCapturePhase::Disabled => "disabled",
+            super::AutoCapturePhase::Observing => "observing",
+            super::AutoCapturePhase::Starting => "starting",
+            super::AutoCapturePhase::RetryScheduled => "retry_scheduled",
+            super::AutoCapturePhase::Recording => "recording",
+            super::AutoCapturePhase::Stopping => "stopping",
+            super::AutoCapturePhase::NeedsAction => "needs_action",
+            super::AutoCapturePhase::Failed => "failed",
+        };
+        let mut entry = super::diagnostics::JournalEntry::new(
+            super::diagnostics::JournalEvent::StateTransition,
+        )
+        .state(state)
+        .attempt(status.attempt)
+        .degraded_reasons(&status.degraded_reasons);
+        if let Some(session_id) = status.session_id.as_deref() {
+            entry = entry.session_id(session_id);
+        }
+        if let Some(recording_id) = status.recording_id.as_deref() {
+            entry = entry.recording_id(recording_id);
+        }
+        if let Some(error_code) = status.error_code.as_deref() {
+            entry = entry.error_code(error_code);
+        }
+        super::diagnostics::record(entry);
         if let Err(error) = app.emit("auto-capture-status-changed", status) {
             log::warn!("Unable to emit automatic capture status: {error}");
         }

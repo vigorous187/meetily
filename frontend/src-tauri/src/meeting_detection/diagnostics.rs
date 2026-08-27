@@ -171,7 +171,8 @@ impl SanitizedJournal {
             .open(self.path(0))
             .map_err(|_| "diagnostic_file_unavailable")?;
         serde_json::to_writer(&mut file, entry).map_err(|_| "diagnostic_serialize_failed")?;
-        file.write_all(b"\n").map_err(|_| "diagnostic_write_failed")
+        file.write_all(b"\n")
+            .map_err(|_| "diagnostic_write_failed".to_string())
     }
 
     fn path(&self, index: usize) -> PathBuf {

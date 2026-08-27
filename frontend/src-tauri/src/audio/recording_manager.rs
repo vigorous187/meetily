@@ -67,16 +67,23 @@ impl RecordingManager {
         microphone_device: Option<Arc<AudioDevice>>,
         system_device: Option<Arc<AudioDevice>>,
         auto_save: bool,
-    ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
+        transcription_enabled: bool,
+    ) -> Result<Option<mpsc::UnboundedReceiver<AudioChunk>>> {
         info!("Starting recording manager (auto_save: {})", auto_save);
 
-        // Set up transcription channel
-        let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        // Audio-only degraded sessions do not allocate an unconsumed
+        // transcription queue. The recording pipeline remains fully active.
+        let (transcription_sender, transcription_receiver) = if transcription_enabled {
+            let (sender, receiver) = mpsc::unbounded_channel::<AudioChunk>();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
 
         // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
         // Pipeline will mix mic + system audio professionally and send to this channel
         // Pass auto_save to control whether audio checkpoints are created
-        let recording_sender = self.recording_saver.start_accumulation(auto_save);
+        let recording_sender = self.recording_saver.start_accumulation(auto_save)?;
 
         // Diarization is best-effort and fully local. Failure to create its private
         // temporary file must never prevent a meeting from being recorded.
@@ -188,7 +195,11 @@ impl RecordingManager {
     ///
     /// User still hears audio via Bluetooth (playback), but recording captures
     /// via stable wired path for best quality.
-    pub async fn start_recording_with_defaults_and_auto_save(&mut self, auto_save: bool) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
+    pub async fn start_recording_with_defaults_and_auto_save(
+        &mut self,
+        auto_save: bool,
+        transcription_enabled: bool,
+    ) -> Result<Option<mpsc::UnboundedReceiver<AudioChunk>>> {
         #[cfg(target_os = "macos")]
         {
             info!("🎙️ [macOS] Starting recording with smart device selection (Bluetooth override enabled)");
@@ -207,7 +218,13 @@ impl RecordingManager {
             }
 
             // Start recording with selected devices and auto_save setting
-            self.start_recording(microphone_device, system_device, auto_save).await
+            self.start_recording(
+                microphone_device,
+                system_device,
+                auto_save,
+                transcription_enabled,
+            )
+            .await
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -242,7 +259,13 @@ impl RecordingManager {
                 return Err(anyhow::anyhow!("No microphone device available"));
             }
 
-            self.start_recording(microphone_device, system_device, auto_save).await
+            self.start_recording(
+                microphone_device,
+                system_device,
+                auto_save,
+                transcription_enabled,
+            )
+            .await
         }
     }
 
@@ -338,7 +361,7 @@ impl RecordingManager {
             }
             Err(e) => {
                 error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
+                return Err(anyhow::anyhow!(e));
             }
         }
 

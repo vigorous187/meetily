@@ -679,7 +679,7 @@ impl AudioCapture {
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+    transcription_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
     state: Arc<RecordingState>,
     mic_vad_processor: ContinuousVadProcessor,
     system_vad_processor: ContinuousVadProcessor,
@@ -702,7 +702,7 @@ pub struct AudioPipeline {
 impl AudioPipeline {
     pub fn new(
         receiver: mpsc::UnboundedReceiver<AudioChunk>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        transcription_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
@@ -911,6 +911,9 @@ impl AudioPipeline {
     }
 
     fn send_speech_segments(&mut self, segments: Vec<SpeechSegment>, device_type: DeviceType) {
+        let Some(transcription_sender) = self.transcription_sender.as_ref() else {
+            return;
+        };
         for segment in segments {
             let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
             if segment.samples.len() < 800 {
@@ -925,7 +928,7 @@ impl AudioPipeline {
                 chunk_id: self.chunk_id_counter,
                 device_type: device_type.clone(),
             };
-            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+            if let Err(e) = transcription_sender.send(transcription_chunk) {
                 warn!("Failed to send {:?} VAD segment: {}", device_type, e);
             } else {
                 self.chunk_id_counter += 1;
@@ -953,7 +956,7 @@ impl AudioPipelineManager {
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        transcription_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,

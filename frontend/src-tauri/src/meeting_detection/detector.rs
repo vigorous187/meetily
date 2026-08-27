@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use super::signals::{classify_active_candidate, CandidateApp, SignalProvider};
+use super::signals::{
+    classify_meeting_evidence, CandidateApp, EvidenceConfidence, SignalProvider,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DetectorConfig {
@@ -23,6 +25,7 @@ impl Default for DetectorConfig {
 pub enum DetectorEvent {
     MeetingStarted { candidate: CandidateApp },
     MeetingEnded { candidate: CandidateApp },
+    PossibleMeeting { candidate: CandidateApp },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +67,7 @@ pub struct LocalMeetingDetector<P> {
     config: DetectorConfig,
     state: MeetingDetectorState,
     last_observed_at: Duration,
+    possible_candidate: Option<CandidateApp>,
 }
 
 impl<P> LocalMeetingDetector<P> {
@@ -73,12 +77,27 @@ impl<P> LocalMeetingDetector<P> {
             config,
             state: MeetingDetectorState::Idle,
             last_observed_at: Duration::ZERO,
+            possible_candidate: None,
         }
     }
 
     pub fn into_provider(self) -> P {
         self.provider
     }
+
+    /// Reconcile a backend-owned automatic recording after a detector worker
+    /// restart. The next missing-evidence sample enters the normal end grace
+    /// period instead of orphaning the recording forever.
+    pub fn restore_active(&mut self, candidate: CandidateApp) {
+        self.state = MeetingDetectorState::Active { candidate };
+        self.possible_candidate = None;
+    }
+}
+
+fn candidates_compatible(active: CandidateApp, observed: CandidateApp) -> bool {
+    active == observed
+        || active == CandidateApp::BrowserCall
+        || observed == CandidateApp::BrowserCall
 }
 
 impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
@@ -112,17 +131,41 @@ impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
             self.state = MeetingDetectorState::Idle;
         }
 
-        let candidate = classify_active_candidate(&snapshot.applications);
+        let evidence = classify_meeting_evidence(&snapshot.applications);
+        let candidate = evidence.and_then(|value| {
+            (value.confidence == EvidenceConfidence::High).then_some(value.candidate)
+        });
+        let sustaining_candidate = evidence.and_then(|value| {
+            (value.confidence == EvidenceConfidence::High
+                || value.input_active
+                || value.output_active)
+                .then_some(value.candidate)
+        });
 
-        match (self.state, candidate) {
-            (MeetingDetectorState::Idle | MeetingDetectorState::Suppressed, Some(candidate)) => {
+        if evidence.is_none() {
+            self.possible_candidate = None;
+        } else if evidence.is_some_and(|value| value.confidence == EvidenceConfidence::High) {
+            self.possible_candidate = None;
+        } else if !matches!(
+            self.state,
+            MeetingDetectorState::Active { .. } | MeetingDetectorState::Ending { .. }
+        ) {
+            let possible = evidence.expect("possible evidence is present").candidate;
+            if self.possible_candidate != Some(possible) {
+                self.possible_candidate = Some(possible);
+                return Ok(Some(DetectorEvent::PossibleMeeting { candidate: possible }));
+            }
+        }
+
+        match (self.state, candidate, sustaining_candidate) {
+            (MeetingDetectorState::Idle | MeetingDetectorState::Suppressed, Some(candidate), _) => {
                 self.state = MeetingDetectorState::Observing {
                     candidate,
                     active_since: now,
                 };
                 Ok(None)
             }
-            (MeetingDetectorState::Idle | MeetingDetectorState::Suppressed, None) => Ok(None),
+            (MeetingDetectorState::Idle | MeetingDetectorState::Suppressed, None, _) => Ok(None),
 
             (
                 MeetingDetectorState::Observing {
@@ -130,6 +173,7 @@ impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
                     active_since,
                 },
                 Some(candidate),
+                _,
             ) if active == candidate => {
                 if now.saturating_sub(active_since) >= self.config.sustained_meeting_activity {
                     self.state = MeetingDetectorState::Active { candidate };
@@ -138,42 +182,38 @@ impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
                     Ok(None)
                 }
             }
-            (MeetingDetectorState::Observing { .. }, Some(candidate)) => {
+            (MeetingDetectorState::Observing { .. }, Some(candidate), _) => {
                 self.state = MeetingDetectorState::Observing {
                     candidate,
                     active_since: now,
                 };
                 Ok(None)
             }
-            (MeetingDetectorState::Observing { .. }, None) => {
+            (MeetingDetectorState::Observing { .. }, None, _) => {
                 self.state = MeetingDetectorState::Idle;
                 Ok(None)
             }
 
-            (MeetingDetectorState::Active { candidate: active }, Some(candidate))
-                if active == candidate =>
+            (MeetingDetectorState::Active { candidate: active }, _, Some(candidate))
+                if candidates_compatible(active, candidate) =>
             {
                 Ok(None)
             }
-            (MeetingDetectorState::Active { candidate }, None) => {
+            (MeetingDetectorState::Active { candidate }, _, _) => {
                 self.state = MeetingDetectorState::Ending {
                     candidate,
                     inactive_since: now,
                 };
                 Ok(None)
             }
-            (MeetingDetectorState::Active { candidate }, Some(_)) => {
-                self.state = MeetingDetectorState::Idle;
-                Ok(Some(DetectorEvent::MeetingEnded { candidate }))
-            }
-
             (
                 MeetingDetectorState::Ending {
                     candidate: active, ..
                 },
+                _,
                 Some(candidate),
-            ) if active == candidate => {
-                self.state = MeetingDetectorState::Active { candidate };
+            ) if candidates_compatible(active, candidate) => {
+                self.state = MeetingDetectorState::Active { candidate: active };
                 Ok(None)
             }
             (
@@ -181,7 +221,8 @@ impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
                     candidate,
                     inactive_since,
                 },
-                None,
+                _,
+                _,
             ) => {
                 if now.saturating_sub(inactive_since) >= self.config.meeting_end_grace_period {
                     self.state = MeetingDetectorState::Idle;
@@ -190,24 +231,19 @@ impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
                     Ok(None)
                 }
             }
-            (MeetingDetectorState::Ending { candidate, .. }, Some(_)) => {
-                self.state = MeetingDetectorState::Idle;
-                Ok(Some(DetectorEvent::MeetingEnded { candidate }))
-            }
-
-            (MeetingDetectorState::Dismissed { candidate: active }, Some(candidate))
+            (MeetingDetectorState::Dismissed { candidate: active }, Some(candidate), _)
                 if active == candidate =>
             {
                 Ok(None)
             }
-            (MeetingDetectorState::Dismissed { .. }, Some(candidate)) => {
+            (MeetingDetectorState::Dismissed { .. }, Some(candidate), _) => {
                 self.state = MeetingDetectorState::Observing {
                     candidate,
                     active_since: now,
                 };
                 Ok(None)
             }
-            (MeetingDetectorState::Dismissed { .. }, None) => {
+            (MeetingDetectorState::Dismissed { .. }, None, _) => {
                 self.state = MeetingDetectorState::Idle;
                 Ok(None)
             }
@@ -396,6 +432,80 @@ mod tests {
             detector.poll().unwrap(),
             Some(DetectorEvent::MeetingEnded {
                 candidate: CandidateApp::GoogleMeet
+            })
+        );
+    }
+
+    #[test]
+    fn browser_output_only_notifies_once_without_starting() {
+        let browser_audio = |seconds| SignalSnapshot {
+            observed_at: Duration::from_secs(seconds),
+            applications: vec![ObservedApplication {
+                process_name: "Google Chrome".to_string(),
+                is_audio_output_active: true,
+                ..ObservedApplication::default()
+            }],
+            recording_active: false,
+            dictation_active: false,
+        };
+        let mut detector = detector(vec![browser_audio(0), browser_audio(8)]);
+
+        assert_eq!(
+            detector.poll().unwrap(),
+            Some(DetectorEvent::PossibleMeeting {
+                candidate: CandidateApp::BrowserCall,
+            })
+        );
+        assert_eq!(detector.poll().unwrap(), None);
+        assert_eq!(detector.state(), MeetingDetectorState::Idle);
+    }
+
+    #[test]
+    fn established_browser_survives_context_loss_with_correlated_audio() {
+        let context_and_audio = |seconds| SignalSnapshot {
+            observed_at: Duration::from_secs(seconds),
+            applications: vec![ObservedApplication {
+                process_name: "Firefox".to_string(),
+                meeting_context: Some(CandidateApp::GoogleMeet),
+                is_audio_output_active: true,
+                ..ObservedApplication::default()
+            }],
+            recording_active: false,
+            dictation_active: false,
+        };
+        let audio_only = |seconds| SignalSnapshot {
+            observed_at: Duration::from_secs(seconds),
+            applications: vec![ObservedApplication {
+                process_name: "Firefox".to_string(),
+                is_audio_output_active: true,
+                ..ObservedApplication::default()
+            }],
+            recording_active: false,
+            dictation_active: false,
+        };
+        let mut detector = detector(vec![context_and_audio(0), context_and_audio(4), audio_only(20)]);
+
+        assert_eq!(detector.poll().unwrap(), None);
+        assert!(matches!(detector.poll().unwrap(), Some(DetectorEvent::MeetingStarted { .. })));
+        assert_eq!(detector.poll().unwrap(), None);
+        assert_eq!(
+            detector.state(),
+            MeetingDetectorState::Active {
+                candidate: CandidateApp::GoogleMeet,
+            }
+        );
+    }
+
+    #[test]
+    fn restored_recording_ends_after_absence_grace() {
+        let mut detector = detector(vec![sample(0, None, false), sample(15, None, false)]);
+        detector.restore_active(CandidateApp::Zoom);
+
+        assert_eq!(detector.poll().unwrap(), None);
+        assert_eq!(
+            detector.poll().unwrap(),
+            Some(DetectorEvent::MeetingEnded {
+                candidate: CandidateApp::Zoom,
             })
         );
     }

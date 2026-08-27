@@ -87,6 +87,9 @@ impl AudioError {
 #[derive(Debug, Default)]
 pub struct RecordingStats {
     pub chunks_processed: u64,
+    pub microphone_chunks: u64,
+    pub system_chunks: u64,
+    pub system_non_silent_chunks: u64,
     pub total_duration: f64,
     pub last_activity: Option<Instant>,
 }
@@ -155,6 +158,7 @@ impl RecordingState {
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
         *self.last_error.lock().unwrap() = None;
+        *self.stats.lock().unwrap() = RecordingStats::default();
         Ok(())
     }
 
@@ -268,12 +272,23 @@ impl RecordingState {
             return Ok(()); // Silently discard chunks while paused
         }
 
+        let device_type = chunk.device_type.clone();
+        let non_silent = chunk.data.iter().any(|sample| sample.abs() > 0.00001);
         if let Some(sender) = self.audio_sender.lock().unwrap().as_ref() {
             sender.send(chunk).map_err(|_| anyhow::anyhow!("Failed to send audio chunk"))?;
 
             // Update statistics
             let mut stats = self.stats.lock().unwrap();
             stats.chunks_processed += 1;
+            match device_type {
+                DeviceType::Microphone => stats.microphone_chunks += 1,
+                DeviceType::System => {
+                    stats.system_chunks += 1;
+                    if non_silent {
+                        stats.system_non_silent_chunks += 1;
+                    }
+                }
+            }
             stats.last_activity = Some(Instant::now());
             Ok(())
         } else {
@@ -442,6 +457,9 @@ impl Clone for RecordingStats {
     fn clone(&self) -> Self {
         Self {
             chunks_processed: self.chunks_processed,
+            microphone_chunks: self.microphone_chunks,
+            system_chunks: self.system_chunks,
+            system_non_silent_chunks: self.system_non_silent_chunks,
             total_duration: self.total_duration,
             last_activity: self.last_activity,
         }

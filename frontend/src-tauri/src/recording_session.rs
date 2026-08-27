@@ -85,6 +85,7 @@ pub async fn start_automatic<R: Runtime>(
     meeting_session_id: String,
     candidate: String,
 ) -> Result<StartReceipt, RecordingSessionError> {
+    let unique_name = format!("{} {}", candidate, meeting_session_id);
     start(
         app,
         RecordingOrigin::Automatic {
@@ -93,7 +94,7 @@ pub async fn start_automatic<R: Runtime>(
         },
         None,
         None,
-        Some(candidate),
+        Some(unique_name),
     )
     .await
 }
@@ -173,11 +174,7 @@ pub async fn stop_manual<R: Runtime>(
     }
     recording_commands::stop_recording(app, args)
         .await
-        .map_err(|error| RecordingSessionError {
-            code: "recording_stop_failed",
-            message: error,
-            transient: true,
-        })?;
+        .map_err(classify_stop_error)?;
     authority.active = None;
     Ok(())
 }
@@ -216,11 +213,7 @@ pub async fn stop_automatic<R: Runtime>(
         },
     )
     .await
-    .map_err(|error| RecordingSessionError {
-        code: "recording_stop_failed",
-        message: error,
-        transient: true,
-    })?;
+    .map_err(classify_stop_error)?;
     authority.active = None;
     Ok(())
 }
@@ -239,7 +232,13 @@ fn reconcile_locked(authority: &mut AuthorityState) {
 
 fn classify_start_error(error: &str) -> RecordingSessionError {
     let normalized = error.to_ascii_lowercase();
-    if normalized.contains("dictation") {
+    if normalized.contains("no_output_available") {
+        RecordingSessionError {
+            code: "no_output_available",
+            message: error.to_string(),
+            transient: false,
+        }
+    } else if normalized.contains("dictation") {
         RecordingSessionError {
             code: "dictation_active",
             message: error.to_string(),
@@ -278,6 +277,21 @@ fn classify_start_error(error: &str) -> RecordingSessionError {
     }
 }
 
+fn classify_stop_error(error: String) -> RecordingSessionError {
+    let code = if error.contains("recording_save_timeout") {
+        "recording_save_timeout"
+    } else if error.contains("recording_save_failed") {
+        "recording_save_failed"
+    } else {
+        "recording_stop_failed"
+    };
+    RecordingSessionError {
+        code,
+        message: error,
+        transient: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +303,10 @@ mod tests {
         assert_eq!(
             classify_start_error("model is downloading").code,
             "transcription_unavailable"
+        );
+        assert_eq!(
+            classify_stop_error("recording_save_failed: disk full".to_string()).code,
+            "recording_save_failed"
         );
     }
 

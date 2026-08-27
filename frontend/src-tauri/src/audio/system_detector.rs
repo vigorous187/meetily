@@ -376,11 +376,15 @@ pub(crate) fn list_system_audio_using_apps() -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn list_audio_process_activity() -> Vec<AudioProcessActivity> {
-    let Ok(processes) = ca::System::processes() else {
-        return Vec::new();
-    };
+    try_list_audio_process_activity().unwrap_or_default()
+}
 
-    processes
+#[cfg(target_os = "macos")]
+pub(crate) fn try_list_audio_process_activity(
+) -> Result<Vec<AudioProcessActivity>, &'static str> {
+    let processes = ca::System::processes().map_err(|_| "core_audio_process_query_failed")?;
+
+    Ok(processes
         .into_iter()
         .filter_map(|process| {
             let pid = process.pid().ok()?;
@@ -410,7 +414,7 @@ pub(crate) fn list_audio_process_activity() -> Vec<AudioProcessActivity> {
             })
         })
         .filter(|activity| activity.input_active || activity.output_active)
-        .collect()
+        .collect())
 }
 
 // Stub implementation for non-macOS platforms

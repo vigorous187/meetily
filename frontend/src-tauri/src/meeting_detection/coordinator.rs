@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::CandidateApp;
@@ -115,10 +115,12 @@ pub struct AutoCaptureCoordinator<I = UuidMeetingSessionIdSource> {
     attempt: u32,
     recording_id: Option<String>,
     next_retry_at: Option<Duration>,
+    current_time: Duration,
     degraded_reasons: Vec<String>,
     error_code: Option<String>,
     message: String,
     last_result: Option<String>,
+    phase_before_source_failure: Option<AutoCapturePhase>,
     id_source: I,
 }
 
@@ -138,10 +140,12 @@ impl<I: MeetingSessionIdSource> AutoCaptureCoordinator<I> {
             attempt: 0,
             recording_id: None,
             next_retry_at: None,
+            current_time: Duration::ZERO,
             degraded_reasons: Vec::new(),
             error_code: None,
             message: "Automatic capture is disabled".to_string(),
             last_result: None,
+            phase_before_source_failure: None,
             id_source,
         }
     }
@@ -165,11 +169,76 @@ impl<I: MeetingSessionIdSource> AutoCaptureCoordinator<I> {
             state: self.phase,
             attempt: self.attempt,
             recording_id: self.recording_id.clone(),
-            next_retry_at_ms: self.next_retry_at.map(duration_millis),
+            next_retry_at_ms: self
+                .next_retry_at
+                .and_then(|deadline| retry_epoch_millis(deadline, self.current_time)),
             degraded_reasons: self.degraded_reasons.clone(),
             error_code: self.error_code.clone(),
             message: self.message.clone(),
         }
+    }
+
+    /// Every active detected occurrence survives detector-worker restarts.
+    /// Ownership remains separately acknowledged; restoring detector state is
+    /// only what allows absence grace to cancel a pending start or retry.
+    pub fn recovery_candidate(&self) -> Option<CandidateApp> {
+        let occurrence = self.occurrence.as_ref()?;
+        (self.enabled && occurrence.active).then_some(occurrence.candidate)
+    }
+
+    pub fn update_degraded_reasons(&mut self, reasons: Vec<String>) -> bool {
+        if self.phase != AutoCapturePhase::Recording || self.degraded_reasons == reasons {
+            return false;
+        }
+        self.degraded_reasons = reasons;
+        self.message = if self.degraded_reasons.is_empty() {
+            "Meeting is recording automatically".to_string()
+        } else {
+            "Meeting is recording with reduced audio coverage".to_string()
+        };
+        true
+    }
+
+    pub fn signal_source_failed(&mut self, error_code: &str) {
+        if self.phase_before_source_failure.is_none() {
+            self.phase_before_source_failure = Some(self.phase);
+        }
+        self.phase = AutoCapturePhase::Failed;
+        self.error_code = Some(error_code.to_string());
+        self.message = "A local meeting-signal source failed; detection is restarting".to_string();
+        self.last_result = Some(error_code.to_string());
+    }
+
+    pub fn signal_source_recovered(&mut self) {
+        if !self
+            .error_code
+            .as_deref()
+            .is_some_and(|code| {
+                code == "window_enumeration_failed"
+                    || code == "core_audio_process_query_failed"
+                    || code == "detector_worker_panicked"
+            })
+        {
+            self.phase_before_source_failure = None;
+            return;
+        }
+        self.error_code = None;
+        self.phase = self.phase_before_source_failure.take().unwrap_or_else(|| {
+            if self.recording_id.is_some() {
+                AutoCapturePhase::Recording
+            } else if self.enabled {
+                AutoCapturePhase::Observing
+            } else {
+                AutoCapturePhase::Disabled
+            }
+        });
+        self.message = if self.recording_id.is_some() {
+            "Meeting is recording automatically".to_string()
+        } else if self.enabled {
+            "Watching for a meeting".to_string()
+        } else {
+            "Automatic capture is disabled".to_string()
+        };
     }
 
     pub fn set_detector_running(&mut self, running: bool) {
@@ -183,6 +252,7 @@ impl<I: MeetingSessionIdSource> AutoCaptureCoordinator<I> {
 
     pub fn set_enabled(&mut self, enabled: bool) -> Option<CoordinatorAction> {
         self.enabled = enabled;
+        self.phase_before_source_failure = None;
         self.error_code = None;
         self.next_retry_at = None;
         if enabled {
@@ -289,6 +359,7 @@ impl<I: MeetingSessionIdSource> AutoCaptureCoordinator<I> {
         recording_active: bool,
         dictation_active: bool,
     ) -> Option<CoordinatorAction> {
+        self.current_time = now;
         let Some(occurrence) = self.occurrence.as_mut() else {
             return None;
         };
@@ -386,6 +457,7 @@ impl<I: MeetingSessionIdSource> AutoCaptureCoordinator<I> {
         error: AutoCaptureError,
         now: Duration,
     ) {
+        self.current_time = now;
         let Some(occurrence) = self.occurrence.as_ref() else {
             return;
         };
@@ -504,8 +576,10 @@ fn retry_delay_after_attempt(attempt: u32) -> Duration {
     }
 }
 
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX)
+fn retry_epoch_millis(deadline: Duration, current_time: Duration) -> Option<u64> {
+    let retry_at = SystemTime::now().checked_add(deadline.saturating_sub(current_time))?;
+    let millis = retry_at.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    Some(millis.try_into().unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -570,7 +644,7 @@ mod tests {
             AutoCaptureError::transient("audio_busy", "Audio is busy"),
             Duration::from_secs(10),
         );
-        assert_eq!(coordinator.health().status.next_retry_at_ms, Some(12_000));
+        assert!(coordinator.health().status.next_retry_at_ms.is_some());
         assert!(coordinator.tick(Duration::from_secs(11), false, false).is_none());
         assert!(matches!(
             coordinator.tick(Duration::from_secs(12), false, false),
@@ -582,7 +656,7 @@ mod tests {
             AutoCaptureError::transient("audio_busy", "Audio is busy"),
             Duration::from_secs(12),
         );
-        assert_eq!(coordinator.health().status.next_retry_at_ms, Some(17_000));
+        assert!(coordinator.health().status.next_retry_at_ms.is_some());
     }
 
     #[test]
@@ -694,5 +768,49 @@ mod tests {
             .expect("stale recording cleanup");
         assert!(matches!(action, CoordinatorAction::Stop { .. }));
         assert_eq!(coordinator.health().status.session_id.as_deref(), Some("meeting-1"));
+    }
+
+    #[test]
+    fn signal_source_failure_is_visible_and_restores_prior_phase() {
+        let mut coordinator = coordinator();
+        enable_and_start(&mut coordinator);
+        coordinator.start_succeeded("meeting-1", receipt("recording-1"));
+
+        coordinator.signal_source_failed("core_audio_process_query_failed");
+        assert_eq!(coordinator.health().status.state, AutoCapturePhase::Failed);
+        assert_eq!(
+            coordinator.health().status.error_code.as_deref(),
+            Some("core_audio_process_query_failed")
+        );
+
+        coordinator.signal_source_recovered();
+        assert_eq!(coordinator.health().status.state, AutoCapturePhase::Recording);
+        assert_eq!(coordinator.health().status.error_code, None);
+    }
+
+    #[test]
+    fn pending_occurrence_restores_detector_state_after_worker_restart() {
+        let mut coordinator = coordinator();
+        enable_and_start(&mut coordinator);
+        coordinator.start_failed(
+            "meeting-1",
+            AutoCaptureError::transient("audio_busy", "Audio is busy"),
+            Duration::ZERO,
+        );
+        assert_eq!(coordinator.recovery_candidate(), Some(CandidateApp::Zoom));
+    }
+
+    #[test]
+    fn live_audio_health_updates_degraded_status() {
+        let mut coordinator = coordinator();
+        enable_and_start(&mut coordinator);
+        coordinator.start_succeeded("meeting-1", receipt("recording-1"));
+
+        assert!(coordinator.update_degraded_reasons(vec!["system_audio_silent".to_string()]));
+        assert_eq!(
+            coordinator.health().status.degraded_reasons,
+            vec!["system_audio_silent".to_string()]
+        );
+        assert!(!coordinator.update_degraded_reasons(vec!["system_audio_silent".to_string()]));
     }
 }

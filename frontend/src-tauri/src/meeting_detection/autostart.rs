@@ -1,5 +1,8 @@
 use serde::Serialize;
 use tauri::{AppHandle, Runtime};
+use tauri_plugin_store::StoreExt;
+
+pub(crate) const LAUNCH_AT_LOGIN_CONFIGURED: &str = "launch_at_login_configured";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +75,10 @@ pub fn set_launch_at_login<R: Runtime>(
                 "launch_at_login_update_failed",
                 "Launch-at-login could not be updated.",
             );
+        }
+        if let Ok(store) = app.store("preferences.json") {
+            store.set(LAUNCH_AT_LOGIN_CONFIGURED, serde_json::Value::Bool(true));
+            let _ = store.save();
         }
         get_launch_at_login_status(app)
     }
