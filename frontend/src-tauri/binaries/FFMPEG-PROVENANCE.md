@@ -34,18 +34,10 @@ imports.
 
 ## Packaged application artifact
 
-Tauri strips local/debug symbols while assembling the macOS application bundle.
-That deterministic packaging step changes the file size and hash without changing
-the FFmpeg version, configuration, architecture, or linked libraries. Meetily's
-release runtime pins and verifies this final adjacent sidecar before every spawn:
-
-- Packaged file: `Meetily.app/Contents/MacOS/ffmpeg`
-- Size: `22,057,536` bytes
-- SHA-256: `9547d85ee85eb7d9480c517c9e224d739780e3f2c9e251e5fb585a1ffdcc5437`
-
-The packaged hash above includes the release script's deterministic ad-hoc
-hardened-runtime signature. The FFmpeg sidecar has no entitlements; only the
-main Meetily executable receives the audio-input entitlement.
+Tauri preserves this reviewed executable byte-for-byte in the application
+bundle. Meetily pins and verifies the source size and SHA-256 above before every
+spawn. The sidecar keeps its entitlement-free linker signature and is sealed as
+nested code by the outer application signature.
 
 ## Build configuration
 

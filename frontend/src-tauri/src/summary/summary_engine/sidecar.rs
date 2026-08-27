@@ -21,10 +21,10 @@ use std::os::windows::process::CommandExt;
 use super::models;
 
 #[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
-const PACKAGED_LLAMA_HELPER_SIZE: u64 = 5_160_736;
+const PACKAGED_LLAMA_HELPER_SIZE: u64 = 5_190_784;
 #[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
 const PACKAGED_LLAMA_HELPER_SHA256: &str =
-    "eebae2a1e27acd0258a89630a889e470cdd6a8c896e73359f0d871595df3d296";
+    "68a72d9a4edf64c8284f79e6379e2f0dad5b2d94118591b025f070c8e5fa0daf";
 
 fn file_matches(path: &Path, expected_size: u64, expected_sha256: &str) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {

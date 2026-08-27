@@ -17,10 +17,10 @@ const EXECUTABLE_NAME: &str = "ffmpeg.exe";
 static FFMPEG_PATH: Lazy<Option<PathBuf>> = Lazy::new(find_ffmpeg_path_internal);
 
 #[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
-const PACKAGED_FFMPEG_SIZE: u64 = 22_057_536;
+const PACKAGED_FFMPEG_SIZE: u64 = 22_186_376;
 #[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
 const PACKAGED_FFMPEG_SHA256: &str =
-    "9547d85ee85eb7d9480c517c9e224d739780e3f2c9e251e5fb585a1ffdcc5437";
+    "0c6c0dcac32f2b5a9f19e194fb449783f383a9b0051b068342dd38d85198e0a7";
 
 pub fn find_ffmpeg_path() -> Option<PathBuf> {
     let path = FFMPEG_PATH.as_ref()?.clone();

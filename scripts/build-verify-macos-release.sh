@@ -245,11 +245,11 @@ verify_signed_bundle() {
   done
 
   verify_file_record "$bundle/Contents/MacOS/ffmpeg" \
-    22057536 9547d85ee85eb7d9480c517c9e224d739780e3f2c9e251e5fb585a1ffdcc5437
+    22186376 0c6c0dcac32f2b5a9f19e194fb449783f383a9b0051b068342dd38d85198e0a7
   verify_file_record "$bundle/Contents/MacOS/llama-helper" \
-    5160736 eebae2a1e27acd0258a89630a889e470cdd6a8c896e73359f0d871595df3d296
+    5190784 68a72d9a4edf64c8284f79e6379e2f0dad5b2d94118591b025f070c8e5fa0daf
   verify_file_record "$bundle/Contents/MacOS/diarization-helper" \
-    23369056 03d245d0c69d60b6cae1f1b8e41d18bb7a1d1cda073d831735f882186a3f6773
+    23505600 78ec589bdd38c8d041d6cf5c49c852022c6d996bdf10ef106bb8376040038001
 
   if /usr/bin/xattr -lr "$bundle" 2>/dev/null | /usr/bin/grep -q 'com.apple.FinderInfo'; then
     echo "FinderInfo remains in release bundle" >&2

@@ -14,14 +14,13 @@ dependencies. A missing or changed artifact fails the build before packaging.
 | `llama-helper-aarch64-apple-darwin` | 5,190,784 | `68a72d9a4edf64c8284f79e6379e2f0dad5b2d94118591b025f070c8e5fa0daf` | 11.0 |
 | `diarization-helper-aarch64-apple-darwin` | 23,505,600 | `78ec589bdd38c8d041d6cf5c49c852022c6d996bdf10ef106bb8376040038001` | 11.0 |
 
-The release script applies an entitlement-free ad-hoc hardened-runtime
-signature after copying the reviewed diarization input. The reviewed packaged
-form is 23,369,056 bytes with SHA-256
-`03d245d0c69d60b6cae1f1b8e41d18bb7a1d1cda073d831735f882186a3f6773`.
-Runtime verification accepts only these two exact pre-sign and packaged forms.
-
-The packaged llama helper is 5,160,736 bytes with SHA-256
-`eebae2a1e27acd0258a89630a889e470cdd6a8c896e73359f0d871595df3d296`.
+Tauri preserves both reviewed executables byte-for-byte in the application
+bundle. They keep their entitlement-free linker signatures and are sealed as
+nested code by the outer application signature. Runtime verification pins the
+input records above. Diarization also accepts the legacy 0.4.3 packaged helper
+(23,369,056 bytes, SHA-256
+`03d245d0c69d60b6cae1f1b8e41d18bb7a1d1cda073d831735f882186a3f6773`)
+so existing recordings remain compatible during upgrade.
 
 Both files are thin `arm64` Mach-O executables and link only Apple system
 libraries and frameworks. The diarization helper statically embeds its

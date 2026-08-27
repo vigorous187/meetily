@@ -33,8 +33,7 @@ const REVIEWED_HELPERS: &[(u64, &str)] = &[
         23_505_600,
         "78ec589bdd38c8d041d6cf5c49c852022c6d996bdf10ef106bb8376040038001",
     ),
-    // The same helper after deterministic entitlement-free hardened-runtime
-    // signing by the reviewed release script.
+    // Legacy 0.4.3 helper after entitlement-free hardened-runtime signing.
     (
         23_369_056,
         "03d245d0c69d60b6cae1f1b8e41d18bb7a1d1cda073d831735f882186a3f6773",
