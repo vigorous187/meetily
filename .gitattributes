@@ -1,2 +1,2 @@
 # Preserve the released SQLx checksum for this immutable migration.
-frontend/src-tauri/migrations/20260807000000_add_summary_generation_fencing.sql whitespace=-blank-at-eof
+frontend/src-tauri/migrations/20260807000000_add_summary_generation_fencing.sql text eol=lf whitespace=-blank-at-eof
