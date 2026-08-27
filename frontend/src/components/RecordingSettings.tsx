@@ -5,11 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
-import {
-  loadMeetingDetectionEnabled,
-  MEETING_DETECTION_CHANGED_EVENT,
-  saveMeetingDetectionEnabled,
-} from '@/lib/meeting-detection-preference';
+import { AutomaticCaptureHealthCard } from '@/components/AutomaticCaptureHealthCard';
 
 export interface RecordingPreferences {
   save_folder: string;
@@ -34,7 +30,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showRecordingNotification, setShowRecordingNotification] = useState(true);
-  const [meetingDetectionEnabled, setMeetingDetectionEnabled] = useState(false);
 
   // Load recording preferences on component mount
   useEffect(() => {
@@ -57,18 +52,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     };
 
     loadPreferences();
-  }, []);
-
-  useEffect(() => {
-    loadMeetingDetectionEnabled()
-      .then(setMeetingDetectionEnabled)
-      .catch(() => setMeetingDetectionEnabled(false));
-
-    const handlePreferenceChange = (event: Event) => {
-      setMeetingDetectionEnabled(Boolean((event as CustomEvent<boolean>).detail));
-    };
-    window.addEventListener(MEETING_DETECTION_CHANGED_EVENT, handlePreferenceChange);
-    return () => window.removeEventListener(MEETING_DETECTION_CHANGED_EVENT, handlePreferenceChange);
   }, []);
 
   // Load recording notification preference
@@ -135,19 +118,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       });
     } catch (error) {
       console.error('Failed to save notification preference:', error);
-      toast.error('Failed to save preference');
-    }
-  };
-
-  const handleMeetingDetectionToggle = async (enabled: boolean) => {
-    const previous = meetingDetectionEnabled;
-    setMeetingDetectionEnabled(enabled);
-    try {
-      await saveMeetingDetectionEnabled(enabled);
-      toast.success(enabled ? 'Automatic meeting detection enabled' : 'Automatic meeting detection disabled');
-    } catch (error) {
-      setMeetingDetectionEnabled(previous);
-      console.error('Failed to save meeting detection preference:', error);
       toast.error('Failed to save preference');
     }
   };
@@ -258,19 +228,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
         />
       </div>
 
-      {/* Automatic Meeting Detection Toggle */}
-      <div className="flex items-center justify-between p-4 border rounded-lg">
-        <div className="flex-1 pr-4">
-          <div className="font-medium">Automatic Meeting Detection</div>
-          <div className="text-sm text-gray-600">
-            Locally detect active meeting apps and browser calls from window and system-audio metadata, then start and stop recording automatically. No always-on microphone monitoring. Off by default.
-          </div>
-        </div>
-        <Switch
-          checked={meetingDetectionEnabled}
-          onCheckedChange={handleMeetingDetectionToggle}
-        />
-      </div>
+      <AutomaticCaptureHealthCard />
 
       {/* Local Dictation Shortcut */}
       <div className="p-4 border rounded-lg">

@@ -10,7 +10,6 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import Analytics from '@/lib/analytics';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
-import { AUTOMATIC_MEETING_STOP_REQUEST_KEY } from '@/lib/automatic-meeting-lifecycle';
 
 interface RecordingControlsProps {
   isRecording: boolean;
@@ -200,29 +199,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     // Immediately trigger the stop action
     await stopRecordingAction();
   }, [isRecording, isStarting, isStopping, stopRecordingAction, onStopInitiated]);
-
-  // MeetingDetectionProvider emits this only for a recording that it started.
-  // Reuse the normal stop path so audio flushing, transcription completion,
-  // database persistence, and summary generation remain identical to a manual
-  // stop.
-  useEffect(() => {
-    const handleAutomaticMeetingStop = () => {
-      if (sessionStorage.getItem(AUTOMATIC_MEETING_STOP_REQUEST_KEY) !== 'true') {
-        return;
-      }
-      if (!isRecording || isStarting || isStopping) {
-        return;
-      }
-      sessionStorage.removeItem(AUTOMATIC_MEETING_STOP_REQUEST_KEY);
-      void handleStopRecording();
-    };
-
-    window.addEventListener('stop-recording-automatically', handleAutomaticMeetingStop);
-    handleAutomaticMeetingStop();
-    return () => {
-      window.removeEventListener('stop-recording-automatically', handleAutomaticMeetingStop);
-    };
-  }, [handleStopRecording, isRecording, isStarting, isStopping]);
 
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;

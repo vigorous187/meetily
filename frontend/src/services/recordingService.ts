@@ -22,6 +22,17 @@ export interface RecordingStoppedPayload {
   meeting_name?: string;
 }
 
+export type RecordingOrigin =
+  | { type: 'manual' }
+  | { type: 'automatic'; meetingSessionId: string; candidate: string }
+
+export interface StartReceipt {
+  recordingId: string
+  origin: RecordingOrigin
+  transcriptionStatus: 'ready' | 'degraded'
+  degradedReasons: string[]
+}
+
 /**
  * Recording Service
  * Singleton service for managing recording lifecycle operations
@@ -53,10 +64,10 @@ export class RecordingService {
 
   /**
    * Start recording (no device configuration)
-   * @returns Promise<void>
+   * @returns Backend acknowledgement after streams and ownership are committed
    */
-  async startRecording(): Promise<void> {
-    return invoke('start_recording');
+  async startRecording(): Promise<StartReceipt> {
+    return invoke<StartReceipt>('start_recording');
   }
 
   /**
@@ -64,14 +75,14 @@ export class RecordingService {
    * @param micDeviceName - Microphone device name (null for default)
    * @param systemDeviceName - System audio device name (null for none)
    * @param meetingName - Meeting name/title
-   * @returns Promise<void>
+   * @returns Backend acknowledgement after streams and ownership are committed
    */
   async startRecordingWithDevices(
     micDeviceName: string | null,
     systemDeviceName: string | null,
     meetingName: string
-  ): Promise<void> {
-    return invoke('start_recording_with_devices_and_meeting', {
+  ): Promise<StartReceipt> {
+    return invoke<StartReceipt>('start_recording_with_devices_and_meeting', {
       mic_device_name: micDeviceName,
       system_device_name: systemDeviceName,
       meeting_name: meetingName
@@ -112,8 +123,8 @@ export class RecordingService {
    * @param callback - Function to call when recording starts
    * @returns Promise that resolves to unlisten function
    */
-  async onRecordingStarted(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-started', callback);
+  async onRecordingStarted(callback: (receipt?: StartReceipt) => void): Promise<UnlistenFn> {
+    return listen<StartReceipt>('recording-started', ({ payload }) => callback(payload));
   }
 
   /**
