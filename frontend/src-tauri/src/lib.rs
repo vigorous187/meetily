@@ -47,6 +47,7 @@ mod export_core;
 pub mod export;
 mod model_integrity;
 pub mod meeting_detection;
+pub mod recording_session;
 mod path_security;
 pub mod notifications;
 pub mod ollama;
@@ -94,53 +95,31 @@ async fn start_recording<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<recording_session::StartReceipt, String> {
     log_info!("Start recording requested");
-
-    if is_recording().await {
-        return Err("Recording already in progress".to_string());
-    }
-
-    // Call the actual audio recording system with meeting name
-    match audio::recording_commands::start_recording_with_devices_and_meeting(
+    let receipt = recording_session::start_manual(
         app.clone(),
         mic_device_name,
         system_device_name,
         meeting_name.clone(),
     )
     .await
+    .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    RECORDING_FLAG.store(true, Ordering::SeqCst);
+    tray::update_tray_menu(&app);
+
+    let notification_manager_state = app.state::<NotificationManagerState<R>>();
+    if let Err(error) = notifications::commands::show_recording_started_notification(
+        &app,
+        &notification_manager_state,
+        meeting_name,
+    )
+    .await
     {
-        Ok(_) => {
-            RECORDING_FLAG.store(true, Ordering::SeqCst);
-            tray::update_tray_menu(&app);
-
-            log_info!("Recording started successfully");
-
-            // Show recording started notification through NotificationManager
-            // This respects user's notification preferences
-            let notification_manager_state = app.state::<NotificationManagerState<R>>();
-            if let Err(e) = notifications::commands::show_recording_started_notification(
-                &app,
-                &notification_manager_state,
-                meeting_name.clone(),
-            )
-            .await
-            {
-                log_error!(
-                    "Failed to show recording started notification: {}",
-                    e
-                );
-            } else {
-                log_info!("Successfully showed recording started notification");
-            }
-
-            Ok(())
-        }
-        Err(e) => {
-            log_error!("Failed to start audio recording: {}", e);
-            Err(format!("Failed to start recording: {}", e))
-        }
+        // Notification delivery is explicitly non-fatal after capture commits.
+        log_error!("Failed to show recording started notification: {error}");
     }
+    Ok(receipt)
 }
 
 #[tauri::command]
@@ -158,8 +137,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         std::path::Path::new(&args.save_path),
     )?;
 
-    // Call the actual audio recording system to stop
-    match audio::recording_commands::stop_recording(
+    match recording_session::stop_manual(
         app.clone(),
         audio::recording_commands::RecordingArgs {
             save_path: save_path.to_string_lossy().into_owned(),
@@ -276,7 +254,7 @@ async fn start_recording_with_devices<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<recording_session::StartReceipt, String> {
     start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
 }
 
@@ -286,63 +264,15 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<recording_session::StartReceipt, String> {
     log_info!("Start recording with selected devices requested");
-
-    // Clone meeting_name for notification use later
-    let meeting_name_for_notification = meeting_name.clone();
-
-    // Call the recording module functions that support meeting names
-    let recording_result = match (mic_device_name.clone(), system_device_name.clone()) {
-        (None, None) => {
-            log_info!("No devices specified; starting with defaults");
-            audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
-                .await
-        }
-        _ => {
-            log_info!(
-                "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
-                mic_device_name,
-                system_device_name,
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_devices_and_meeting(
-                app.clone(),
-                mic_device_name,
-                system_device_name,
-                meeting_name,
-            )
-            .await
-        }
-    };
-
-    match recording_result {
-        Ok(_) => {
-            log_info!("Recording started successfully via tauri command");
-
-            // Show recording started notification through NotificationManager
-            // This respects user's notification preferences
-            let notification_manager_state = app.state::<NotificationManagerState<R>>();
-            if let Err(e) = notifications::commands::show_recording_started_notification(
-                &app,
-                &notification_manager_state,
-                meeting_name_for_notification.clone(),
-            )
-            .await
-            {
-                log_error!(
-                    "Failed to show recording started notification: {}",
-                    e
-                );
-            }
-
-            Ok(())
-        }
-        Err(e) => {
-            log_error!("Failed to start recording via tauri command: {}", e);
-            Err(e)
-        }
-    }
+    start_recording(
+        app,
+        mic_device_name,
+        system_device_name,
+        meeting_name,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -396,6 +326,10 @@ pub fn run() {
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
             }
+
+            // The automatic-capture worker is backend-owned. Starting it here
+            // keeps detection alive across window hides, navigation and reloads.
+            meeting_detection::runtime::initialize_auto_capture(_app.handle().clone());
 
             // Initialize notification system with proper defaults
             log::info!("Initializing notification system...");
@@ -524,6 +458,9 @@ pub fn run() {
             meeting_detection::runtime::stop_meeting_detection,
             meeting_detection::runtime::dismiss_meeting_detection,
             meeting_detection::runtime::is_meeting_detection_running,
+            meeting_detection::runtime::get_auto_capture_health,
+            meeting_detection::runtime::set_auto_capture_enabled,
+            meeting_detection::runtime::notify_auto_capture_readiness_changed,
             read_audio_file,
             export::export_meeting_markdown,
             analytics::commands::init_analytics,

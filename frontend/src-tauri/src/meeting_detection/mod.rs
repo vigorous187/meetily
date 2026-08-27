@@ -7,6 +7,7 @@
 //! window or recognized system-audio producer can request a prompt.
 
 mod detector;
+mod coordinator;
 pub mod runtime;
 mod signals;
 
@@ -15,6 +16,11 @@ mod macos;
 
 pub use detector::{
     DetectorConfig, DetectorEvent, LocalMeetingDetector, MeetingDetector, MeetingDetectorState,
+};
+pub use coordinator::{
+    AutoCaptureCoordinator, AutoCaptureError, AutoCaptureHealth, AutoCapturePhase,
+    AutoCaptureStatusChanged, CoordinatorAction, MeetingSessionIdSource,
+    UuidMeetingSessionIdSource,
 };
 pub use runtime::{
     dismiss_meeting_detection, is_meeting_detection_running, start_meeting_detection,

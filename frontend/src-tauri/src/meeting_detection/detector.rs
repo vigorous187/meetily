@@ -14,7 +14,7 @@ impl Default for DetectorConfig {
             sustained_meeting_activity: Duration::from_secs(4),
             // Meeting windows and audio indicators can briefly disappear while
             // an app changes views. Do not stop a recording on a short dropout.
-            meeting_end_grace_period: Duration::from_secs(15),
+            meeting_end_grace_period: Duration::from_secs(30),
         }
     }
 }

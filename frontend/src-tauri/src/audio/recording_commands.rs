@@ -296,13 +296,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         info!("✅ Transcript-update event listener registered for history persistence");
     }
 
-    // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started successfully with parallel processing",
-        "devices": ["Default Microphone", "Default System Audio"],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
-
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
 
@@ -472,16 +465,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         *global_listener = Some(listener_id);
         info!("✅ Transcript-update event listener registered for history persistence");
     }
-
-    // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started with custom devices and parallel processing",
-        "devices": [
-            mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
-            system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
-        ],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -891,15 +874,17 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Emit final stop event with folder_path and meeting_name for frontend to save
-    app.emit(
+    if let Err(error) = app.emit(
         "recording-stopped",
         serde_json::json!({
             "message": "Recording stopped - frontend will save after all transcripts received",
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str
         }),
-    )
-    .map_err(|e| e.to_string())?;
+    ) {
+        // Saving and shutdown are complete. UI event delivery is advisory.
+        warn!("Recording stopped but recording-stopped delivery failed: {error}");
+    }
 
     // Update tray menu to reflect stopped state
     crate::tray::update_tray_menu(&app);
@@ -920,6 +905,20 @@ pub async fn is_recording() -> bool {
 /// actual recording manager.
 pub fn is_recording_active() -> bool {
     IS_RECORDING.load(Ordering::SeqCst)
+}
+
+/// User-safe audio limitations attached to an acknowledged start receipt.
+pub fn current_degraded_reasons() -> Vec<String> {
+    let manager_guard = RECORDING_MANAGER.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(manager) = manager_guard.as_ref() else {
+        return Vec::new();
+    };
+    let state = manager.get_state();
+    let mut reasons = Vec::new();
+    if state.get_system_device().is_none() {
+        reasons.push("system_audio_unavailable".to_string());
+    }
+    reasons
 }
 
 /// Get recording statistics

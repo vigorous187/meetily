@@ -75,7 +75,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             let save_path = data_dir.join(format!("recording-{}.wav", timestamp));
 
             // Call Rust stop_recording command (like pause/resume pattern)
-            let stop_result = crate::audio::recording_commands::stop_recording(
+            let stop_result = crate::recording_session::stop_manual(
                 app_clone.clone(),
                 crate::audio::recording_commands::RecordingArgs {
                     save_path: save_path.to_string_lossy().to_string(),
@@ -171,7 +171,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
         let save_path = data_dir.join(format!("recording-{}.wav", timestamp));
 
         // Call Rust stop_recording command (like pause/resume pattern)
-        let stop_result = crate::audio::recording_commands::stop_recording(
+        let stop_result = crate::recording_session::stop_manual(
             app_clone.clone(),
             crate::audio::recording_commands::RecordingArgs {
                 save_path: save_path.to_string_lossy().to_string(),
