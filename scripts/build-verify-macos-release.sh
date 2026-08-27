@@ -164,17 +164,17 @@ for sidecar in "${sidecars[@]}"; do
     echo "Packaged sidecar is missing or unsafe: $sidecar_path" >&2
     exit 4
   }
-  /usr/bin/codesign --force --sign "$signing_identity" --options runtime --timestamp=none "$sidecar_path"
 done
-
-# Seal resources and sign only the main executable with the reviewed entitlement.
-/usr/bin/codesign --force --sign "$signing_identity" --options runtime --timestamp=none \
-  --entitlements "$tauri_dir/entitlements.plist" \
-  "$app_path"
 
 # Finder metadata and other extended attributes make an otherwise valid bundle
 # fail strict verification after copying. Release archives contain none.
 /usr/bin/xattr -cr "$app_path"
+
+# Seal the reviewed ad-hoc sidecars as nested code and sign the outer app with
+# the stable identity. Re-signing sidecars would invalidate their pinned hashes.
+/usr/bin/codesign --force --sign "$signing_identity" --options runtime --timestamp=none \
+  --entitlements "$tauri_dir/entitlements.plist" \
+  "$app_path"
 
 verify_file_record() {
   local path="$1"

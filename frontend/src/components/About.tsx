@@ -6,7 +6,7 @@ import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch";
 
 
 export function About() {
-    const [currentVersion, setCurrentVersion] = useState<string>('0.4.3');
+    const [currentVersion, setCurrentVersion] = useState<string>('0.4.4');
 
     useEffect(() => {
         // Get current version on mount
