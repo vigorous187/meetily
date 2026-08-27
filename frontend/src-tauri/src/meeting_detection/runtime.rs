@@ -618,12 +618,23 @@ async fn execute_action<R: Runtime>(
             recording_id,
         } => {
             let result = crate::recording_session::stop_automatic(
-                app,
+                app.clone(),
                 &meeting_session_id,
                 &recording_id,
             )
             .await
             .map_err(recording_error);
+            if result.is_ok() {
+                // Preserve the existing frontend post-processing contract so
+                // an automatic stop is persisted to SQLite like a tray stop.
+                // Recording ownership and disk cleanup are already complete,
+                // so event delivery remains advisory.
+                if let Err(error) = app.emit("recording-stop-complete", true) {
+                    log::warn!(
+                        "Automatic recording stopped but post-processing delivery failed: {error}"
+                    );
+                }
+            }
             let mut save_entry = super::diagnostics::JournalEntry::new(
                 super::diagnostics::JournalEvent::SaveResult,
             )
