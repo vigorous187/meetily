@@ -96,8 +96,6 @@ impl<P> LocalMeetingDetector<P> {
 
 fn candidates_compatible(active: CandidateApp, observed: CandidateApp) -> bool {
     active == observed
-        || active == CandidateApp::BrowserCall
-        || observed == CandidateApp::BrowserCall
 }
 
 impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
@@ -137,8 +135,8 @@ impl<P: SignalProvider> MeetingDetector for LocalMeetingDetector<P> {
         });
         let sustaining_candidate = evidence.and_then(|value| {
             (value.confidence == EvidenceConfidence::High
-                || value.input_active
-                || value.output_active)
+                || (value.candidate != CandidateApp::BrowserCall
+                    && (value.input_active || value.output_active)))
                 .then_some(value.candidate)
         });
 
@@ -461,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn established_browser_survives_context_loss_with_correlated_audio() {
+    fn established_browser_ends_after_context_loss_despite_unrelated_audio() {
         let context_and_audio = |seconds| SignalSnapshot {
             observed_at: Duration::from_secs(seconds),
             applications: vec![ObservedApplication {
@@ -483,16 +481,28 @@ mod tests {
             recording_active: false,
             dictation_active: false,
         };
-        let mut detector = detector(vec![context_and_audio(0), context_and_audio(4), audio_only(20)]);
+        let mut detector = detector(vec![
+            context_and_audio(0),
+            context_and_audio(4),
+            audio_only(20),
+            audio_only(35),
+        ]);
 
         assert_eq!(detector.poll().unwrap(), None);
         assert!(matches!(detector.poll().unwrap(), Some(DetectorEvent::MeetingStarted { .. })));
         assert_eq!(detector.poll().unwrap(), None);
         assert_eq!(
             detector.state(),
-            MeetingDetectorState::Active {
+            MeetingDetectorState::Ending {
                 candidate: CandidateApp::GoogleMeet,
+                inactive_since: Duration::from_secs(20),
             }
+        );
+        assert_eq!(
+            detector.poll().unwrap(),
+            Some(DetectorEvent::MeetingEnded {
+                candidate: CandidateApp::GoogleMeet,
+            })
         );
     }
 
